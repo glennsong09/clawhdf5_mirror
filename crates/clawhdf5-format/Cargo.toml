@@ -1,0 +1,50 @@
+[package]
+name = "clawhdf5-format"
+version = "2.0.0"
+edition = "2024"
+description = "Pure-Rust HDF5 binary format parsing and writing — no C dependencies"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"
+readme = "README.md"
+keywords = ["hdf5", "science", "data", "binary", "no-std"]
+categories = ["parser-implementations", "science", "encoding", "no-std"]
+
+[dependencies]
+byteorder = { version = "1", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+rayon = { version = "1", optional = true }
+crc32fast = { version = "1", optional = true }
+lz4_flex = { version = "0.11", optional = true }
+zstd = { version = "0.13", optional = true }
+blake3 = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+clawhdf5-derive = { path = "../clawhdf5-derive", version = "2.0.0" }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[features]
+default = ["std", "checksum", "deflate", "provenance", "fast-deflate", "system-zlib-decompress"]
+std = []
+checksum = []
+deflate = ["flate2"]
+provenance = ["sha2"]
+parallel = ["rayon", "std"]
+fast-checksum = ["crc32fast"]
+fast-deflate = ["flate2/zlib-ng"]
+system-zlib = ["flate2/zlib-default"]
+system-zlib-decompress = []
+zlib-rs = ["flate2/zlib-rs"]
+lz4 = ["lz4_flex"]
+zstd = ["dep:zstd"]
+blake3_hash = ["blake3"]
+
+[[bench]]
+name = "parallel_decompress_bench"
+harness = false
+required-features = ["parallel"]

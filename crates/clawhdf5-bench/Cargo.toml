@@ -1,0 +1,32 @@
+[package]
+name = "clawhdf5-bench"
+version = "2.0.0"
+edition = "2024"
+description = "Benchmark harnesses for clawhdf5-agent (Track 8)"
+license = "MIT"
+
+[[bin]]
+name = "longmemeval_bench"
+path = "src/bin/longmemeval_bench.rs"
+
+[[bin]]
+name = "memory_arena"
+path = "src/bin/memory_arena.rs"
+
+[[bin]]
+name = "footprint_bench"
+path = "src/bin/footprint_bench.rs"
+
+[[bin]]
+name = "consolidation_efficiency"
+path = "src/bin/consolidation_efficiency.rs"
+
+[[bin]]
+name = "ephemeral_perf"
+path = "src/bin/ephemeral_perf.rs"
+
+[dependencies]
+clawhdf5-agent = { path = "../clawhdf5-agent" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

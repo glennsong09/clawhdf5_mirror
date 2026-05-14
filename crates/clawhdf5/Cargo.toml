@@ -1,0 +1,44 @@
+[package]
+name = "clawhdf5"
+version = "2.0.0"
+edition = "2024"
+description = "Pure-Rust HDF5 reader/writer — no C dependencies"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"
+readme = "README.md"
+keywords = ["hdf5", "science", "data", "binary"]
+categories = ["parser-implementations", "science", "encoding"]
+
+[dependencies]
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
+clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0" }
+rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+clawhdf5-io = { path = "../clawhdf5-io", version = "2.0.0", features = ["mmap"] }
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0", features = ["parallel", "fast-checksum"] }
+clawhdf5-filters = { path = "../clawhdf5-filters", version = "2.0.0" }
+
+[[bench]]
+name = "mmap_bench"
+harness = false
+
+[[bench]]
+name = "parallel_bench"
+harness = false
+
+[features]
+default = ["mmap", "fast-deflate"]
+mmap = ["clawhdf5-io/mmap"]
+parallel = ["clawhdf5-format/parallel", "rayon"]
+fast-deflate = ["clawhdf5-format/fast-deflate"]
+apple-compression = []
+zstd = ["clawhdf5-format/zstd"]
+blake3_hash = ["clawhdf5-format/blake3_hash"]
+lz4 = ["clawhdf5-format/lz4"]
+
+[package.metadata.docs.rs]
+features = ["mmap"]
+targets = ["x86_64-unknown-linux-gnu"]

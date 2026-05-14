@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/clawhdf5-format",
+    "crates/clawhdf5-types",
+    "crates/clawhdf5-io",
+    "crates/clawhdf5-filters",
+    "crates/clawhdf5-derive",
+    "crates/clawhdf5",
+    "crates/clawhdf5-netcdf4",
+    "crates/clawhdf5-ann",
+    "crates/clawhdf5-py",
+    "crates/clawhdf5-gpu",
+    "crates/clawhdf5-accel",
+    "crates/clawhdf5-agent",
+    "crates/clawhdf5-migrate",
+    "crates/clawhdf5-android",
+    "crates/clawhdf5-cli",
+    "crates/clawhdf5-napi",
+    "crates/clawhdf5-bench",
+]
+resolver = "2"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"

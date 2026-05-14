@@ -1,0 +1,32 @@
+[package]
+name = "clawhdf5-filters"
+version = "2.0.0"
+edition = "2024"
+description = "Filter and compression pipeline for rustyhdf5"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"
+readme = "README.md"
+keywords = ["hdf5", "compression", "deflate", "filters"]
+categories = ["compression", "science"]
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "deflate_bench"
+harness = false
+
+[[bench]]
+name = "compression_bench"
+harness = false
+
+[features]
+default = ["fast-deflate"]
+fast-deflate = ["flate2/zlib-ng"]
+system-zlib = ["flate2/zlib-default"]
+zlib-rs = ["flate2/zlib-rs"]
+apple-compression = []

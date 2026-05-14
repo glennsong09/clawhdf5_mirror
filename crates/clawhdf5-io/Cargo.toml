@@ -1,0 +1,28 @@
+[package]
+name = "clawhdf5-io"
+version = "2.0.0"
+edition = "2024"
+description = "I/O abstraction layer for rustyhdf5"
+license = "MIT"
+repository = "https://github.com/redclawsystems/clawhdf5"
+readme = "README.md"
+keywords = ["hdf5", "io", "science", "data"]
+categories = ["filesystem", "science"]
+
+[dependencies]
+clawhdf5-format = { path = "../clawhdf5-format", version = "2.0.0" }
+memmap2 = { version = "0.9", optional = true }
+libc = { version = "0.2", optional = true }
+tokio = { version = "1", features = ["fs", "io-util"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []
+mmap = ["memmap2", "libc"]
+async = ["tokio"]
+hsds = ["reqwest", "serde", "serde_json", "async"]
