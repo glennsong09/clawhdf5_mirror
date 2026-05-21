@@ -464,8 +464,8 @@ async fn background_writer(
                             Ok(indices)
                         })
                         .await
-                        .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other, e,
+                        .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::other(
+                            e,
                         ))));
                         dirty = result.is_ok();
                         let _ = reply.send(result);
@@ -498,8 +498,8 @@ async fn background_writer(
                                 m.flush_wal()
                             })
                             .await
-                            .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other, e,
+                            .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::other(
+                                e,
                             ))));
                             if result.is_ok() { dirty = false; }
                             let _ = reply.send(result);
@@ -515,8 +515,8 @@ async fn background_writer(
                             m.tick_session()
                         })
                         .await
-                        .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other, e,
+                        .unwrap_or_else(|e| Err(MemoryError::Io(std::io::Error::other(
+                            e,
                         ))));
                         if result.is_ok() { dirty = false; }
                         let _ = reply.send(result);
@@ -549,7 +549,7 @@ async fn background_writer(
 // ---------------------------------------------------------------------------
 
 fn join_err(e: tokio::task::JoinError) -> MemoryError {
-    MemoryError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+    MemoryError::Io(std::io::Error::other(e))
 }
 
 fn channel_gone() -> MemoryError {

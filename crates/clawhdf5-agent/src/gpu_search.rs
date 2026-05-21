@@ -115,8 +115,8 @@ impl GpuSearchBackend {
             }
 
             // If we don't have an accelerator but now above threshold, try init
-            if vectors.len() >= self.threshold {
-                if let Ok(mut accel) = clawhdf5_gpu::GpuAccelerator::new() {
+            if vectors.len() >= self.threshold
+                && let Ok(mut accel) = clawhdf5_gpu::GpuAccelerator::new() {
                     let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
                     if accel.upload_vectors(&flat, self.dim).is_ok()
                         && accel.upload_norms(norms).is_ok()
@@ -124,7 +124,6 @@ impl GpuSearchBackend {
                         self.accelerator = Some(accel);
                     }
                 }
-            }
         }
 
         #[cfg(not(feature = "gpu"))]
