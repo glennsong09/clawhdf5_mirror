@@ -8,8 +8,8 @@ use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_ZSTD,
-    FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FILTER_ZSTD, FilterPipeline,
 };
 
 /// Apply a filter pipeline to decompress a chunk.
@@ -30,6 +30,7 @@ pub fn decompress_chunk(
             FILTER_ZSTD => zstd_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
             FILTER_SCALEOFFSET => scaleoffset_decompress(&data, &filter.client_data)?,
+            FILTER_NBIT => nbit_decompress(&data, &filter.client_data)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -295,6 +296,75 @@ fn write_elements(values: &[i64], elem_size: usize, big_endian: bool) -> Vec<u8>
         }
     }
     out
+}
+
+/// Decode the HDF5 N-Bit filter (id 5), atomic (integer/float) variant.
+///
+/// N-Bit strips the unused leading/trailing bits of a datatype whose precision
+/// is smaller than its storage size and packs the significant `precision` bits
+/// of each element MSB-first, contiguously, with no header. Decompression
+/// reverses this: it reads `precision` bits per element and places them at bit
+/// `offset` of a zero-filled `size`-byte element — which is exactly HDF5's
+/// canonical on-disk layout for a reduced-precision value (the high bits are
+/// zero; sign extension of signed reduced-precision integers is the datatype
+/// reader's responsibility, as it is for un-filtered reduced-precision data).
+///
+/// `cd` is the `H5Znbit.c` parameter block: `[2]`=element count,
+/// `[3]`=type class (1 = atomic), and for atomics `[4]`=storage size,
+/// `[5]`=byte order (1 = big-endian), `[6]`=precision (bits), `[7]`=bit offset.
+/// The recursive compound/array layouts are reported as unsupported.
+fn nbit_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
+    const H5Z_NBIT_ATOMIC: u32 = 1;
+    if cd.len() < 8 {
+        return Err(FormatError::ChunkedReadError(
+            "nbit: missing filter client data".into(),
+        ));
+    }
+    let nelmts = cd[2] as usize;
+    if cd[3] != H5Z_NBIT_ATOMIC {
+        // Compound/array N-Bit layouts encode a recursive parameter tree.
+        return Err(FormatError::UnsupportedFilter(FILTER_NBIT));
+    }
+    let size = cd[4] as usize;
+    let big_endian = cd[5] == 1;
+    let precision = cd[6] as usize;
+    let offset = cd[7] as usize;
+    if size == 0 || size > 8 || precision == 0 || offset + precision > size * 8 {
+        return Err(FormatError::ChunkedReadError(
+            "nbit: invalid atomic parameters".into(),
+        ));
+    }
+
+    let need_bits = nelmts
+        .checked_mul(precision)
+        .ok_or_else(|| FormatError::ChunkedReadError("nbit: size overflow".into()))?;
+    if data.len() * 8 < need_bits {
+        return Err(FormatError::ChunkedReadError(
+            "nbit: packed data too short".into(),
+        ));
+    }
+
+    let mut out = vec![0u8; nelmts * size];
+    let mut bitpos = 0usize;
+    for elem in out.chunks_exact_mut(size) {
+        // Read `precision` bits MSB-first into the significant value.
+        let mut value: u64 = 0;
+        for _ in 0..precision {
+            let bit = (data[bitpos / 8] >> (7 - (bitpos % 8))) & 1;
+            value = (value << 1) | bit as u64;
+            bitpos += 1;
+        }
+        // Place the value at its bit offset; the rest of the element stays zero.
+        let le = (value << offset).to_le_bytes();
+        if big_endian {
+            for (j, slot) in elem.iter_mut().enumerate() {
+                *slot = le[size - 1 - j];
+            }
+        } else {
+            elem.copy_from_slice(&le[..size]);
+        }
+    }
+    Ok(out)
 }
 
 /// Decompress zlib-compressed data.
@@ -1030,6 +1100,50 @@ mod tests {
         assert!(matches!(
             scaleoffset_decompress(&raw, &cd),
             Err(FormatError::UnsupportedFilter(FILTER_SCALEOFFSET))
+        ));
+    }
+
+    // --- N-Bit (filter id 5) --------------------------------------------------
+    // Real compressed chunks + client data from h5py 3.16 / HDF5 2.0. The
+    // expected outputs are the canonical zero-filled element bytes (verified
+    // equal to the contiguous, un-filtered on-disk layout of the same type).
+
+    #[test]
+    fn nbit_unsigned_12bit() {
+        // u32 storage, 12-bit precision: [0, 1, 4095, 2048].
+        let cd = [8u32, 0, 4, 1, 4, 0, 12, 0];
+        let raw = [0x00, 0x00, 0x01, 0xff, 0xf8, 0x00, 0x00];
+        let expected: Vec<u8> = [0u32, 1, 4095, 2048]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+    }
+
+    #[test]
+    fn nbit_signed_16bit_zero_filled() {
+        // i32 storage, 16-bit precision: [-1, -50, 100, -1000]. N-Bit restores
+        // the canonical zero-filled layout (high 16 bits zero); the datatype
+        // reader is responsible for sign-extending reduced-precision integers.
+        let cd = [8u32, 0, 4, 1, 4, 0, 16, 0];
+        let raw = [0xff, 0xff, 0xff, 0xce, 0x00, 0x64, 0xfc, 0x18, 0x00];
+        // Canonical bytes captured from an equivalent un-filtered dataset.
+        let expected: Vec<u8> = vec![
+            0xff, 0xff, 0x00, 0x00, // 0x0000ffff
+            0xce, 0xff, 0x00, 0x00, // 0x0000ffce
+            0x64, 0x00, 0x00, 0x00, // 0x00000064
+            0x18, 0xfc, 0x00, 0x00, // 0x0000fc18
+        ];
+        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+    }
+
+    #[test]
+    fn nbit_compound_unsupported() {
+        // class != 1 (atomic) is the recursive compound/array layout.
+        let cd = [8u32, 0, 4, 2, 4, 0, 16, 0];
+        assert!(matches!(
+            nbit_decompress(&[0u8; 8], &cd),
+            Err(FormatError::UnsupportedFilter(FILTER_NBIT))
         ));
     }
 }
