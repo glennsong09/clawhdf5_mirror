@@ -1,9 +1,9 @@
-# rustyhdf5-derive
+# clawhdf5-derive
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-derive.svg)](https://crates.io/crates/rustyhdf5-derive)
-[![docs.rs](https://docs.rs/rustyhdf5-derive/badge.svg)](https://docs.rs/rustyhdf5-derive)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-derive.svg)](https://crates.io/crates/clawhdf5-derive)
+[![docs.rs](https://docs.rs/clawhdf5-derive/badge.svg)](https://docs.rs/clawhdf5-derive)
 
-Derive macros for rustyhdf5 HDF5 traits.
+Derive macros for clawhdf5 HDF5 traits.
 
 ## Features
 
@@ -13,7 +13,7 @@ Derive macros for rustyhdf5 HDF5 traits.
 ## Usage
 
 ```rust
-use rustyhdf5_derive::HDF5Type;
+use clawhdf5_derive::HDF5Type;
 
 #[derive(HDF5Type)]
 struct Point {

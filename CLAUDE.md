@@ -54,7 +54,7 @@ cargo test --workspace
 ### CLI
 ```bash
 cargo run -p clawhdf5-cli -- --help
-# inspect, dump, index, search subcommands
+# create, save, search, recall, stats, flush-wal, agents-md, export, snapshot subcommands
 ```
 
 ### Python bindings

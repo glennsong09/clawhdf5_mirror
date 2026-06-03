@@ -1,9 +1,9 @@
-# rustyhdf5-types
+# clawhdf5-types
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-types.svg)](https://crates.io/crates/rustyhdf5-types)
-[![docs.rs](https://docs.rs/rustyhdf5-types/badge.svg)](https://docs.rs/rustyhdf5-types)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-types.svg)](https://crates.io/crates/clawhdf5-types)
+[![docs.rs](https://docs.rs/clawhdf5-types/badge.svg)](https://docs.rs/clawhdf5-types)
 
-HDF5 type system definitions for the rustyhdf5 ecosystem.
+HDF5 type system definitions for the clawhdf5 ecosystem.
 
 ## Features
 
@@ -13,7 +13,7 @@ HDF5 type system definitions for the rustyhdf5 ecosystem.
 ## Usage
 
 ```rust
-use rustyhdf5_types::HDF5Type;
+use clawhdf5_types::HDF5Type;
 ```
 
 ## License

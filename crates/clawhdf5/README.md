@@ -1,7 +1,7 @@
-# rustyhdf5
+# clawhdf5
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5.svg)](https://crates.io/crates/rustyhdf5)
-[![docs.rs](https://docs.rs/rustyhdf5/badge.svg)](https://docs.rs/rustyhdf5)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5.svg)](https://crates.io/crates/clawhdf5)
+[![docs.rs](https://docs.rs/clawhdf5/badge.svg)](https://docs.rs/clawhdf5)
 
 Pure-Rust HDF5 reader/writer — no C dependencies.
 
@@ -16,7 +16,7 @@ Pure-Rust HDF5 reader/writer — no C dependencies.
 ## Usage
 
 ```rust
-use rustyhdf5::File;
+use clawhdf5::File;
 
 let file = File::open("data.h5").unwrap();
 let dataset = file.dataset("/group/data").unwrap();

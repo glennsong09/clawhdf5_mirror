@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-417%20passing-brightgreen.svg)](#benchmarks)
+[![Tests](https://img.shields.io/badge/tests-1500%2B%20passing-brightgreen.svg)](#benchmarks)
 [![LongMemEval](https://img.shields.io/badge/LongMemEval-Hit@5%2046%25%20BM25--only-blue.svg)](BENCHMARKS.md#longmemeval-results)
 [![Footprint](https://img.shields.io/badge/footprint-6.5%20KB%2Frecord-lightgrey.svg)](BENCHMARKS.md#memory-footprint)
 
@@ -313,7 +313,7 @@ let exported = backend.export_markdown("MEMORY.md")?;
 ## Crate Map
 
 ```
-clawhdf5 workspace (15 crates, 72K lines of Rust)
+clawhdf5 workspace (17 crates, 84K lines of Rust)
 │
 ├── Core HDF5
 │   ├── clawhdf5-types      — Type system definitions
@@ -327,14 +327,18 @@ clawhdf5 workspace (15 crates, 72K lines of Rust)
 │   └── clawhdf5-gpu         — GPU compute (wgpu)
 │
 ├── Agent Memory
-│   ├── clawhdf5-agent       — Memory engine (16.8K lines, 29 modules)
-│   ├── clawhdf5-ann         — HNSW approximate nearest neighbor
+│   ├── clawhdf5-agent       — Memory engine (20.7K lines, 32 modules)
+│   ├── clawhdf5-ann         — HNSW approximate nearest neighbor (default backend)
 │   ├── clawhdf5-migrate     — SQLite → HDF5 migration
 │   ├── clawhdf5-android     — Android JNI bridge
 │   └── clawhdf5-cli         — CLI tool
 │
-└── Bindings
-    └── clawhdf5-py          — Python (PyO3)
+├── Bindings
+│   ├── clawhdf5-py          — Python (PyO3)
+│   └── clawhdf5-napi        — Node.js (napi-rs)
+│
+└── Tooling
+    └── clawhdf5-bench       — Benchmark suite
 ```
 
 ---

@@ -1,9 +1,9 @@
-# rustyhdf5-io
+# clawhdf5-io
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-io.svg)](https://crates.io/crates/rustyhdf5-io)
-[![docs.rs](https://docs.rs/rustyhdf5-io/badge.svg)](https://docs.rs/rustyhdf5-io)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-io.svg)](https://crates.io/crates/clawhdf5-io)
+[![docs.rs](https://docs.rs/clawhdf5-io/badge.svg)](https://docs.rs/clawhdf5-io)
 
-I/O abstraction layer for rustyhdf5.
+I/O abstraction layer for clawhdf5.
 
 ## Features
 
@@ -15,7 +15,7 @@ I/O abstraction layer for rustyhdf5.
 ## Usage
 
 ```rust
-use rustyhdf5_io::MmapReader;
+use clawhdf5_io::MmapReader;
 
 let reader = MmapReader::open("data.h5").unwrap();
 ```

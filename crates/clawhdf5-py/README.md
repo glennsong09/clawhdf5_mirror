@@ -1,9 +1,9 @@
-# rustyhdf5-py
+# clawhdf5-py
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-py.svg)](https://crates.io/crates/rustyhdf5-py)
-[![docs.rs](https://docs.rs/rustyhdf5-py/badge.svg)](https://docs.rs/rustyhdf5-py)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-py.svg)](https://crates.io/crates/clawhdf5-py)
+[![docs.rs](https://docs.rs/clawhdf5-py/badge.svg)](https://docs.rs/clawhdf5-py)
 
-Python bindings for rustyhdf5 — a pure-Rust HDF5 library.
+Python bindings for clawhdf5 — a pure-Rust HDF5 library.
 
 ## Features
 
@@ -14,9 +14,9 @@ Python bindings for rustyhdf5 — a pure-Rust HDF5 library.
 ## Usage
 
 ```python
-import rustyhdf5
+import clawhdf5
 
-with rustyhdf5.File('data.h5', 'r') as f:
+with clawhdf5.File('data.h5', 'r') as f:
     data = f['/dataset'][:]
 ```
 

@@ -1,7 +1,7 @@
-# rustyhdf5-format
+# clawhdf5-format
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-format.svg)](https://crates.io/crates/rustyhdf5-format)
-[![docs.rs](https://docs.rs/rustyhdf5-format/badge.svg)](https://docs.rs/rustyhdf5-format)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-format.svg)](https://crates.io/crates/clawhdf5-format)
+[![docs.rs](https://docs.rs/clawhdf5-format/badge.svg)](https://docs.rs/clawhdf5-format)
 
 Pure-Rust HDF5 binary format parsing and writing — no C dependencies.
 
@@ -16,7 +16,7 @@ Pure-Rust HDF5 binary format parsing and writing — no C dependencies.
 ## Usage
 
 ```rust
-use rustyhdf5_format::Superblock;
+use clawhdf5_format::Superblock;
 
 let data = std::fs::read("data.h5").unwrap();
 let sb = Superblock::from_bytes(&data).unwrap();

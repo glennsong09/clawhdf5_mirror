@@ -1,9 +1,9 @@
-# rustyhdf5-gpu
+# clawhdf5-gpu
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-gpu.svg)](https://crates.io/crates/rustyhdf5-gpu)
-[![docs.rs](https://docs.rs/rustyhdf5-gpu/badge.svg)](https://docs.rs/rustyhdf5-gpu)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-gpu.svg)](https://crates.io/crates/clawhdf5-gpu)
+[![docs.rs](https://docs.rs/clawhdf5-gpu/badge.svg)](https://docs.rs/clawhdf5-gpu)
 
-GPU-accelerated vector operations for rustyhdf5 using wgpu compute shaders.
+GPU-accelerated vector operations for clawhdf5 using wgpu compute shaders.
 
 ## Features
 
@@ -14,7 +14,7 @@ GPU-accelerated vector operations for rustyhdf5 using wgpu compute shaders.
 ## Usage
 
 ```rust
-use rustyhdf5_gpu::GpuAccelerator;
+use clawhdf5_gpu::GpuAccelerator;
 
 let accel = GpuAccelerator::new().unwrap();
 let distances = accel.l2_distances(&query, &vectors).unwrap();

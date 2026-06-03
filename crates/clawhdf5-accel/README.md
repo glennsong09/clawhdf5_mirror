@@ -1,9 +1,9 @@
-# rustyhdf5-accel
+# clawhdf5-accel
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-accel.svg)](https://crates.io/crates/rustyhdf5-accel)
-[![docs.rs](https://docs.rs/rustyhdf5-accel/badge.svg)](https://docs.rs/rustyhdf5-accel)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-accel.svg)](https://crates.io/crates/clawhdf5-accel)
+[![docs.rs](https://docs.rs/clawhdf5-accel/badge.svg)](https://docs.rs/clawhdf5-accel)
 
-SIMD-accelerated operations for rustyhdf5.
+SIMD-accelerated operations for clawhdf5.
 
 ## Features
 
@@ -15,7 +15,7 @@ SIMD-accelerated operations for rustyhdf5.
 ## Usage
 
 ```rust
-use rustyhdf5_accel::checksum::crc32_simd;
+use clawhdf5_accel::checksum::crc32_simd;
 
 let crc = crc32_simd(&data);
 ```

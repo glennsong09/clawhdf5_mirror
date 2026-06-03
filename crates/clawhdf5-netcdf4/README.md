@@ -1,9 +1,9 @@
-# rustyhdf5-netcdf4
+# clawhdf5-netcdf4
 
-[![crates.io](https://img.shields.io/crates/v/rustyhdf5-netcdf4.svg)](https://crates.io/crates/rustyhdf5-netcdf4)
-[![docs.rs](https://docs.rs/rustyhdf5-netcdf4/badge.svg)](https://docs.rs/rustyhdf5-netcdf4)
+[![crates.io](https://img.shields.io/crates/v/clawhdf5-netcdf4.svg)](https://crates.io/crates/clawhdf5-netcdf4)
+[![docs.rs](https://docs.rs/clawhdf5-netcdf4/badge.svg)](https://docs.rs/clawhdf5-netcdf4)
 
-NetCDF-4 read support built on rustyhdf5 — pure Rust, no C dependencies.
+NetCDF-4 read support built on clawhdf5 — pure Rust, no C dependencies.
 
 ## Features
 
@@ -14,7 +14,7 @@ NetCDF-4 read support built on rustyhdf5 — pure Rust, no C dependencies.
 ## Usage
 
 ```rust
-use rustyhdf5_netcdf4::NetCDF4File;
+use clawhdf5_netcdf4::NetCDF4File;
 
 let nc = NetCDF4File::open("climate.nc").unwrap();
 let temp = nc.variable("temperature").unwrap();
