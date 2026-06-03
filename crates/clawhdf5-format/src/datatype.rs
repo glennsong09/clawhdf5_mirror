@@ -348,7 +348,10 @@ impl Datatype {
                 let num_members = (bf0 as u16) | ((bf1 as u16) << 8);
                 let mut members = Vec::with_capacity(num_members as usize);
 
-                if version == 3 || version == 4 {
+                if (3..=5).contains(&version) {
+                    // v3, v4 and v5 share the compact member encoding (name,
+                    // variable-width offset, member datatype). HDF5 1.14+/2.0
+                    // with `libver=latest` emits v5 compound types.
                     let ob = offset_bytes_for_size(size);
                     for _ in 0..num_members {
                         let (name, name_len) = read_null_terminated_string(data, pos)?;
@@ -1002,6 +1005,53 @@ mod tests {
                     Datatype::FloatingPoint { size: 8, .. } => {}
                     other => panic!("expected f64, got {other:?}"),
                 }
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn test_compound_v5_from_hdf5_2_0() {
+        // Real datatype message bytes emitted by h5py 3.16 / HDF5 2.0 with
+        // `libver=latest` for a compound dtype [('x','f8'),('y','f8'),('id','i4')].
+        // The wrapper is datatype version 5; members reuse the v3 compact
+        // encoding. Regression guard for reading modern-format compound types.
+        let bytes: [u8; 70] = [
+            0x56, 0x03, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x11, 0x20, 0x3f,
+            0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x34, 0x0b, 0x00, 0x34, 0xff,
+            0x03, 0x00, 0x00, 0x79, 0x00, 0x08, 0x11, 0x20, 0x3f, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x40, 0x00, 0x34, 0x0b, 0x00, 0x34, 0xff, 0x03, 0x00, 0x00, 0x69, 0x64,
+            0x00, 0x10, 0x10, 0x08, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
+        ];
+        let (dt, _) = Datatype::parse(&bytes).unwrap();
+        match dt {
+            Datatype::Compound { size, members } => {
+                assert_eq!(size, 20);
+                assert_eq!(members.len(), 3);
+                assert_eq!(
+                    (members[0].name.as_str(), members[0].byte_offset),
+                    ("x", 0)
+                );
+                assert_eq!(
+                    (members[1].name.as_str(), members[1].byte_offset),
+                    ("y", 8)
+                );
+                assert_eq!(
+                    (members[2].name.as_str(), members[2].byte_offset),
+                    ("id", 16)
+                );
+                assert!(matches!(
+                    members[0].datatype,
+                    Datatype::FloatingPoint { size: 8, .. }
+                ));
+                assert!(matches!(
+                    members[2].datatype,
+                    Datatype::FixedPoint {
+                        size: 4,
+                        signed: true,
+                        ..
+                    }
+                ));
             }
             _ => panic!("expected Compound"),
         }
