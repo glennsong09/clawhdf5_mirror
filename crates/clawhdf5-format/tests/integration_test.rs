@@ -696,6 +696,20 @@ fn v4_virtual_dataset_2d_same_file_read() {
 }
 
 #[test]
+fn scaleoffset_float_escale_reads_as_raw() {
+    // The scale-offset filter's floating-point *E-scale* mode (cd_values[0] = 1)
+    // is not actually implemented by the HDF5 library: when asked for it, HDF5
+    // stores the chunk raw (no minbits/minval header) and sets the chunk filter
+    // mask to skip the filter. So such a dataset must read back verbatim purely
+    // by honoring the per-chunk filter mask — no E-scale decoder is needed.
+    let file_data = include_bytes!("fixtures/scaleoffset_float_escale.h5");
+    let (raw, datatype, _) = read_chunked_dataset(file_data, "x");
+    let values = read_as_f64(&raw, &datatype).unwrap();
+    let expect: Vec<f64> = (0..20).map(|i| i as f64 * 0.25).collect();
+    assert_eq!(values, expect, "E-scale (raw + masked filter) must read verbatim");
+}
+
+#[test]
 fn v4_virtual_dataset_external_file_read() {
     use clawhdf5_format::data_read::read_raw_data_full_with_resolver;
     // The virtual file maps virt[0:8] <- (external) ext_src.h5:/data = [10..17].

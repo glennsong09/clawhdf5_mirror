@@ -39,6 +39,14 @@
   error. The previous `parse_vds_mappings` used a guessed layout that did not
   match real files and is replaced.
 
+### Tests
+- `clawhdf5-format`: regression test for **scale-offset float E-scale**
+  datasets. The HDF5 library does not implement E-scale encoding — when asked
+  for it (`cd_values[0] = 1`) it stores the chunk raw and sets the chunk filter
+  mask to skip the filter — so these files read back verbatim purely by
+  honoring the per-chunk filter mask. The test locks in that behavior against a
+  fixture produced via the HDF5 low-level API; no E-scale decoder is needed.
+
 ### Bug Fixes
 - `clawhdf5-format`: read **paged Fixed Array** chunk indexes. A filtered,
   fixed-dimension dataset with more than one data-block page (>1024 chunks by
