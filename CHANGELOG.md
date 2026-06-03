@@ -9,11 +9,10 @@
   minima, decimal scale factors and fill values; reverse-engineered against
   HDF5 2.0 and validated end-to-end. The float E-scale variant remains
   unsupported.
-- `clawhdf5-format`: decode the **N-Bit filter** (id 5), atomic variant —
-  previously unsupported. Unsigned reduced-precision datasets read end-to-end;
-  signed values are restored to canonical bytes (datatype-level sign extension
-  of reduced-precision integers is a separate, pre-existing concern). Recursive
-  compound/array N-Bit layouts remain unsupported.
+- `clawhdf5-format`: decode the **N-Bit filter** (id 5) — atomic, **compound**
+  and **array** layouts (the full recursive type tree, nestable to any depth),
+  previously unsupported. Signed and unsigned reduced-precision integers and
+  float members all read end-to-end, validated against HDF5 2.0.
 
 ### Bug Fixes
 - `clawhdf5-format`: **sign-extend reduced-precision fixed-point integers** on
