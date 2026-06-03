@@ -67,74 +67,65 @@ pub enum DataLayout {
     },
 }
 
-/// Parse VDS mappings from global heap object data.
+/// Parse VDS mappings from global-heap object data.
 ///
-/// The global heap object for a VDS layout contains a serialized list of
-/// source mappings. Each mapping has:
-/// - Virtual selection (serialized dataspace selection, variable length)
-/// - Source file name (null-terminated string)
-/// - Source dataset name (null-terminated string)
-/// - Source selection (serialized dataspace selection, variable length)
+/// The global-heap block holding a VDS mapping list is laid out as
+/// (reverse-engineered and validated against HDF5 2.0):
 ///
-/// The overall format starts with:
-/// - version (4 bytes LE) — currently 0
-/// - entry count (not explicitly stored; parse until data exhausted)
+/// ```text
+/// version(1) · nused(length_size, LE) · entry[nused] · checksum(4)
+/// ```
 ///
-/// This is a best-effort parser that handles common VDS files. The exact
-/// binary format is not fully specified publicly and may vary by HDF5 version.
-pub fn parse_vds_mappings(heap_data: &[u8]) -> Result<Vec<VdsMapping>, FormatError> {
-    if heap_data.len() < 4 {
+/// Each entry is:
+/// - source file name — a null-terminated string in **block version 0**; in
+///   **block version 1** a same-file reference is encoded as a single `0x04`
+///   marker byte (the source file is the virtual file itself) in place of the
+///   name;
+/// - source dataset name (null-terminated string);
+/// - source selection (serialized `H5S` dataspace selection — self-describing
+///   in length);
+/// - virtual selection (serialized `H5S` dataspace selection).
+///
+/// The selections are decoded with [`crate::selection::Selection`] purely to
+/// learn their byte length so the entry list can be walked; the raw selection
+/// bytes are retained on each [`VdsMapping`] for the reader to interpret.
+pub fn parse_vds_mappings(
+    heap_data: &[u8],
+    length_size: u8,
+) -> Result<Vec<VdsMapping>, FormatError> {
+    use crate::selection::Selection;
+
+    let ls = length_size as usize;
+    if heap_data.len() < 1 + ls {
         return Ok(Vec::new());
     }
-    // VDS global heap object starts with version(4)
-    let _version = u32::from_le_bytes([heap_data[0], heap_data[1], heap_data[2], heap_data[3]]);
-    let mut pos = 4;
-    let mut mappings = Vec::new();
+    let version = heap_data[0];
+    let mut pos = 1;
+    let nused = read_length(heap_data, pos, length_size)?;
+    pos += ls;
 
-    while pos < heap_data.len() {
-        // Each entry: virtual_selection_size(4) + virtual_selection(N) +
-        //             source_file_name(null-term) + source_dataset_name(null-term) +
-        //             source_selection_size(4) + source_selection(N)
-        if pos + 4 > heap_data.len() {
-            break;
-        }
+    let mut mappings = Vec::with_capacity(nused as usize);
+    for _ in 0..nused {
+        // Source file name (with the version-1 same-file marker handled).
+        let source_file = if version >= 1 && heap_data.get(pos) == Some(&0x04) {
+            pos += 1;
+            String::from(".")
+        } else {
+            read_null_terminated_string(heap_data, &mut pos)?
+        };
 
-        // Virtual selection
-        let vsel_size = u32::from_le_bytes([
-            heap_data[pos],
-            heap_data[pos + 1],
-            heap_data[pos + 2],
-            heap_data[pos + 3],
-        ]) as usize;
-        pos += 4;
-        if pos + vsel_size > heap_data.len() {
-            break;
-        }
-        let virtual_selection = heap_data[pos..pos + vsel_size].to_vec();
-        pos += vsel_size;
-
-        // Source file name (null-terminated)
-        let source_file = read_null_terminated_string(heap_data, &mut pos)?;
-
-        // Source dataset name (null-terminated)
+        // Source dataset name.
         let source_dataset = read_null_terminated_string(heap_data, &mut pos)?;
 
-        // Source selection
-        if pos + 4 > heap_data.len() {
-            break;
-        }
-        let ssel_size = u32::from_le_bytes([
-            heap_data[pos],
-            heap_data[pos + 1],
-            heap_data[pos + 2],
-            heap_data[pos + 3],
-        ]) as usize;
-        pos += 4;
-        if pos + ssel_size > heap_data.len() {
-            break;
-        }
-        let source_selection = heap_data[pos..pos + ssel_size].to_vec();
-        pos += ssel_size;
+        // Source selection (self-describing length).
+        let (_, ssel_len) = Selection::decode_serialized(&heap_data[pos..])?;
+        let source_selection = heap_data[pos..pos + ssel_len].to_vec();
+        pos += ssel_len;
+
+        // Virtual selection.
+        let (_, vsel_len) = Selection::decode_serialized(&heap_data[pos..])?;
+        let virtual_selection = heap_data[pos..pos + vsel_len].to_vec();
+        pos += vsel_len;
 
         mappings.push(VdsMapping {
             source_file,
@@ -235,7 +226,7 @@ impl DataLayout {
                     index: *global_heap_index as u16,
                 },
             )?;
-            *mappings = parse_vds_mappings(&obj.data)?;
+            *mappings = parse_vds_mappings(&obj.data, length_size)?;
         }
         Ok(())
     }
@@ -774,32 +765,54 @@ mod tests {
     }
 
     #[test]
-    fn parse_vds_mappings_basic() {
-        // Build a simple VDS mapping blob
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&0u32.to_le_bytes()); // version=0
+    fn parse_vds_mappings_same_file_v1() {
+        // The exact global-heap block written by HDF5 2.0 for a same-file VDS
+        // with two sources: src_a -> virtual[0:4], src_b -> virtual[4:8].
+        let blob = [
+            0x01u8, // block version 1
+            0x02, 0, 0, 0, 0, 0, 0, 0, // nused = 2 (length_size = 8)
+            // entry 0
+            0x04, // same-file marker (replaces file name)
+            0x73, 0x72, 0x63, 0x5f, 0x61, 0x00, // "src_a\0"
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // source sel = ALL
+            0x02, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, // virtual sel: HYPER v3
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x04, 0x00, // start0 stride1 count1 block4
+            // entry 1
+            0x04, 0x73, 0x72, 0x63, 0x5f, 0x62, 0x00, // "src_b\0"
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // source sel = ALL
+            0x02, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, // virtual sel: HYPER v3
+            0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x04, 0x00, // start4 stride1 count1 block4
+            0x68, 0xf0, 0x3e, 0xe4, // checksum (ignored)
+        ];
+        let mappings = parse_vds_mappings(&blob, 8).unwrap();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0].source_file, ".");
+        assert_eq!(mappings[0].source_dataset, "src_a");
+        assert_eq!(mappings[1].source_file, ".");
+        assert_eq!(mappings[1].source_dataset, "src_b");
 
-        // Virtual selection (8 bytes of dummy data)
-        let vsel = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        blob.extend_from_slice(&(vsel.len() as u32).to_le_bytes());
-        blob.extend_from_slice(&vsel);
+        // Virtual selections decode to [0:4] and [4:8].
+        use crate::selection::Selection;
+        let (v0, _) = Selection::decode_serialized(&mappings[0].virtual_selection).unwrap();
+        let (v1, _) = Selection::decode_serialized(&mappings[1].virtual_selection).unwrap();
+        assert_eq!(v0.iter_linear_1d(8).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(v1.iter_linear_1d(8).unwrap(), vec![4, 5, 6, 7]);
+    }
 
-        // Source file name
-        blob.extend_from_slice(b"source.h5\0");
-
-        // Source dataset name
-        blob.extend_from_slice(b"/data\0");
-
-        // Source selection (4 bytes)
-        let ssel = vec![10, 20, 30, 40];
-        blob.extend_from_slice(&(ssel.len() as u32).to_le_bytes());
-        blob.extend_from_slice(&ssel);
-
-        let mappings = parse_vds_mappings(&blob).unwrap();
+    #[test]
+    fn parse_vds_mappings_external_v0() {
+        // Block version 0 with an explicit (external) source file name.
+        let blob = [
+            0x00u8, // block version 0
+            0x01, 0, 0, 0, 0, 0, 0, 0, // nused = 1
+            0x73, 0x72, 0x63, 0x5f, 0x65, 0x78, 0x74, 0x2e, 0x68, 0x35, 0x00, // "src_ext.h5\0"
+            0x64, 0x61, 0x74, 0x61, 0x00, // "data\0"
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // source sel = ALL
+            0x03, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // virtual sel = ALL
+        ];
+        let mappings = parse_vds_mappings(&blob, 8).unwrap();
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].source_file, "source.h5");
-        assert_eq!(mappings[0].source_dataset, "/data");
-        assert_eq!(mappings[0].virtual_selection, vsel);
-        assert_eq!(mappings[0].source_selection, ssel);
+        assert_eq!(mappings[0].source_file, "src_ext.h5");
+        assert_eq!(mappings[0].source_dataset, "data");
     }
 }

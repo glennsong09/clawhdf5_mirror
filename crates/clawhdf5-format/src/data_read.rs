@@ -128,7 +128,19 @@ pub fn read_raw_data_full(
             offset_size,
             length_size,
         ),
-        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVersion(0)),
+        DataLayout::Virtual {
+            global_heap_address,
+            global_heap_index,
+            ..
+        } => read_virtual_data(
+            file_data,
+            *global_heap_address,
+            *global_heap_index,
+            dataspace,
+            datatype,
+            offset_size,
+            length_size,
+        ),
     }
 }
 
@@ -355,8 +367,151 @@ pub fn read_raw_data_selection(
             )?;
             extract_selection_from_buffer(&full_data, dims, elem_size, selection)
         }
-        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVersion(0)),
+        DataLayout::Virtual { .. } => {
+            // Assemble the full virtual dataset, then apply the read selection.
+            let full_data = read_raw_data_full(
+                file_data,
+                layout,
+                dataspace,
+                datatype,
+                pipeline,
+                offset_size,
+                length_size,
+            )?;
+            extract_selection_from_buffer(&full_data, dims, elem_size, selection)
+        }
     }
+}
+
+/// Assemble a **Virtual Dataset (VDS)** from its source mappings.
+///
+/// Supports **1-D, same-file** virtual datasets: each mapping's source dataset
+/// is read from the same file and its selected elements are scattered into the
+/// virtual buffer at the positions given by the virtual selection. Unmapped
+/// regions are left at the zero fill value.
+///
+/// External-file sources and N-dimensional selections are reported as
+/// unsupported rather than silently producing wrong data.
+fn read_virtual_data(
+    file_data: &[u8],
+    global_heap_address: Option<u64>,
+    global_heap_index: u32,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<u8>, FormatError> {
+    use crate::data_layout::parse_vds_mappings;
+    use crate::global_heap::GlobalHeapCollection;
+    use crate::selection::Selection;
+
+    let elem_size = datatype.type_size() as usize;
+    let total_elems = dataspace.num_elements() as usize;
+    let mut out = vec![0u8; total_elems.saturating_mul(elem_size)];
+
+    if dataspace.dimensions.len() > 1 {
+        return Err(FormatError::ChunkedReadError(
+            "N-dimensional virtual datasets are not supported".into(),
+        ));
+    }
+    let virtual_extent = dataspace
+        .dimensions
+        .first()
+        .copied()
+        .unwrap_or(total_elems as u64);
+
+    let addr = global_heap_address.ok_or_else(|| {
+        FormatError::ChunkedReadError("virtual dataset has no mapping global heap".into())
+    })?;
+    let coll = GlobalHeapCollection::parse(file_data, addr as usize, length_size)?;
+    let obj = coll
+        .get_object(global_heap_index as u16)
+        .ok_or(FormatError::GlobalHeapObjectNotFound {
+            collection_address: addr,
+            index: global_heap_index as u16,
+        })?;
+    let mappings = parse_vds_mappings(&obj.data, length_size)?;
+
+    for m in &mappings {
+        // Only same-file sources are reachable through the pure-byte read API.
+        if !(m.source_file.is_empty() || m.source_file == ".") {
+            return Err(FormatError::ChunkedReadError(
+                "external-file virtual dataset sources are not supported".into(),
+            ));
+        }
+
+        let (vsel, _) = Selection::decode_serialized(&m.virtual_selection)?;
+        let (ssel, _) = Selection::decode_serialized(&m.source_selection)?;
+
+        let (src_raw, src_elems) =
+            read_named_dataset_raw(file_data, &m.source_dataset, offset_size, length_size)?;
+
+        let vidx = vsel.iter_linear_1d(virtual_extent)?;
+        let sidx = ssel.iter_linear_1d(src_elems as u64)?;
+        if vidx.len() != sidx.len() {
+            return Err(FormatError::ChunkedReadError(
+                "virtual/source selection element counts differ".into(),
+            ));
+        }
+
+        for (&v, &s) in vidx.iter().zip(sidx.iter()) {
+            let (vo, so) = (v as usize * elem_size, s as usize * elem_size);
+            if vo + elem_size > out.len() || so + elem_size > src_raw.len() {
+                return Err(FormatError::ChunkedReadError(
+                    "virtual dataset selection out of bounds".into(),
+                ));
+            }
+            out[vo..vo + elem_size].copy_from_slice(&src_raw[so..so + elem_size]);
+        }
+    }
+
+    Ok(out)
+}
+
+/// Read a named dataset's raw (decoded) bytes and element count, navigating
+/// from the superblock. Used to pull VDS source datasets out of the same file.
+fn read_named_dataset_raw(
+    file_data: &[u8],
+    path: &str,
+    _offset_size: u8,
+    _length_size: u8,
+) -> Result<(Vec<u8>, usize), FormatError> {
+    use crate::filter_pipeline::FilterPipeline;
+    use crate::group_v2::resolve_path_any;
+    use crate::message_type::MessageType;
+    use crate::object_header::ObjectHeader;
+    use crate::signature::find_signature;
+    use crate::superblock::Superblock;
+
+    let sig = find_signature(file_data)?;
+    let sb = Superblock::parse(file_data, sig)?;
+    let addr = resolve_path_any(file_data, &sb, path)?;
+    let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)?;
+
+    let find = |t: MessageType| hdr.messages.iter().find(|m| m.msg_type == t);
+    let ds_msg = find(MessageType::Dataspace)
+        .ok_or_else(|| FormatError::ChunkedReadError("VDS source has no dataspace".into()))?;
+    let dataspace = Dataspace::parse(&ds_msg.data, sb.length_size)?;
+    let dt_msg = find(MessageType::Datatype)
+        .ok_or_else(|| FormatError::ChunkedReadError("VDS source has no datatype".into()))?;
+    let (datatype, _) = Datatype::parse(&dt_msg.data)?;
+    let dl_msg = find(MessageType::DataLayout)
+        .ok_or_else(|| FormatError::ChunkedReadError("VDS source has no data layout".into()))?;
+    let layout = DataLayout::parse(&dl_msg.data, sb.offset_size, sb.length_size)?;
+    let pipeline = find(MessageType::FilterPipeline)
+        .map(|m| FilterPipeline::parse(&m.data))
+        .transpose()?;
+
+    let raw = read_raw_data_full(
+        file_data,
+        &layout,
+        &dataspace,
+        &datatype,
+        pipeline.as_ref(),
+        sb.offset_size,
+        sb.length_size,
+    )?;
+    Ok((raw, dataspace.num_elements() as usize))
 }
 
 /// Extract selected elements from a full dataset buffer.

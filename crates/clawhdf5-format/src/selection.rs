@@ -19,6 +19,8 @@ use alloc::{vec, vec::Vec};
 
 use core::ops::Range;
 
+use crate::error::FormatError;
+
 /// A selection describing which elements of a dataset to access.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Selection {
@@ -220,6 +222,169 @@ impl Selection {
             }
         }
     }
+
+    /// Decode a selection from its on-disk **`H5S_select_serialize`** form.
+    ///
+    /// Returns the selection and the number of bytes consumed (selections are
+    /// self-describing in length, so the count lets a caller walk a packed list
+    /// of selections — as the Virtual Dataset global-heap block does).
+    ///
+    /// Only the forms needed for VDS assembly are decoded: `ALL`, `NONE`, and
+    /// **regular** hyperslabs serialized at **version 3** (the encoding HDF5
+    /// 1.10+/2.0 emit). Point selections, irregular hyperslabs, and older
+    /// hyperslab versions return an error rather than mis-decoding.
+    pub fn decode_serialized(data: &[u8]) -> Result<(Selection, usize), FormatError> {
+        if data.len() < 8 {
+            return Err(FormatError::UnexpectedEof {
+                expected: 8,
+                available: data.len(),
+            });
+        }
+        let sel_type = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+        match sel_type {
+            // ALL / NONE: type(4) + version(4) + reserved(4) + length(4) = 16 bytes.
+            3 => Ok((Selection::All, 16)),
+            0 => Ok((Selection::None, 16)),
+            2 => decode_hyperslab_serialized(data, version),
+            1 => Err(FormatError::ChunkedReadError(
+                "VDS point selections are not supported".into(),
+            )),
+            _ => Err(FormatError::ChunkedReadError(
+                "unknown dataspace selection type".into(),
+            )),
+        }
+    }
+
+    /// Enumerate the selected element indices of a **1-D** dataspace of the
+    /// given `extent`, in selection order.
+    ///
+    /// Returns an error for selections of rank != 1 (N-dimensional VDS
+    /// assembly is not supported in this build).
+    pub fn iter_linear_1d(&self, extent: u64) -> Result<Vec<u64>, FormatError> {
+        match self {
+            Selection::All => Ok((0..extent).collect()),
+            Selection::None => Ok(Vec::new()),
+            Selection::Hyperslab {
+                start,
+                stride,
+                count,
+                block,
+            } => {
+                if start.len() != 1 {
+                    return Err(FormatError::ChunkedReadError(
+                        "only 1-D VDS hyperslab selections are supported".into(),
+                    ));
+                }
+                let (s, st, c, b) = (start[0], stride[0], count[0], block[0]);
+                let mut out = Vec::new();
+                for ci in 0..c {
+                    let base = s + ci * st;
+                    for bi in 0..b {
+                        let idx = base + bi;
+                        if idx >= extent {
+                            return Err(FormatError::ChunkedReadError(
+                                "VDS hyperslab selection exceeds dataspace extent".into(),
+                            ));
+                        }
+                        out.push(idx);
+                    }
+                }
+                Ok(out)
+            }
+            Selection::Points(pts) => {
+                let mut out = Vec::with_capacity(pts.len());
+                for p in pts {
+                    if p.len() != 1 {
+                        return Err(FormatError::ChunkedReadError(
+                            "only 1-D VDS point selections are supported".into(),
+                        ));
+                    }
+                    if p[0] >= extent {
+                        return Err(FormatError::ChunkedReadError(
+                            "VDS point selection exceeds dataspace extent".into(),
+                        ));
+                    }
+                    out.push(p[0]);
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Decode an `H5S_SEL_HYPER` selection in its serialized form. Only version-3
+/// **regular** hyperslabs are supported.
+fn decode_hyperslab_serialized(
+    data: &[u8],
+    version: u32,
+) -> Result<(Selection, usize), FormatError> {
+    if version != 3 {
+        return Err(FormatError::ChunkedReadError(
+            "only version-3 hyperslab selections are supported".into(),
+        ));
+    }
+    // type(4) ver(4) flags(1) enc_size(1) rank(4) [start,stride,count,block]*rank
+    if data.len() < 14 {
+        return Err(FormatError::UnexpectedEof {
+            expected: 14,
+            available: data.len(),
+        });
+    }
+    let flags = data[8];
+    let enc_size = data[9] as usize;
+    // Bit 0 set => regular hyperslab. Irregular hyperslabs list explicit blocks.
+    if flags & 0x01 == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "irregular VDS hyperslab selections are not supported".into(),
+        ));
+    }
+    if enc_size != 2 && enc_size != 4 && enc_size != 8 {
+        return Err(FormatError::ChunkedReadError(
+            "unsupported hyperslab coordinate encoding size".into(),
+        ));
+    }
+    let rank = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let mut pos = 14;
+    let read_coord = |data: &[u8], pos: usize| -> Result<u64, FormatError> {
+        if pos + enc_size > data.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: pos + enc_size,
+                available: data.len(),
+            });
+        }
+        let mut v = 0u64;
+        for (i, &b) in data[pos..pos + enc_size].iter().enumerate() {
+            v |= (b as u64) << (i * 8);
+        }
+        Ok(v)
+    };
+    let (mut start, mut stride, mut count, mut block) = (
+        Vec::with_capacity(rank),
+        Vec::with_capacity(rank),
+        Vec::with_capacity(rank),
+        Vec::with_capacity(rank),
+    );
+    for _ in 0..rank {
+        start.push(read_coord(data, pos)?);
+        pos += enc_size;
+        stride.push(read_coord(data, pos)?);
+        pos += enc_size;
+        count.push(read_coord(data, pos)?);
+        pos += enc_size;
+        block.push(read_coord(data, pos)?);
+        pos += enc_size;
+    }
+    Ok((
+        Selection::Hyperslab {
+            start,
+            stride,
+            count,
+            block,
+        },
+        pos,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -312,5 +477,80 @@ mod tests {
         assert!(sel.intersects_chunk(&[0], &[5]));
         // Chunk [9..10] should not intersect (only row 9, but selection ends at row 8)
         assert!(!sel.intersects_chunk(&[9], &[1]));
+    }
+
+    #[test]
+    fn decode_all_selection_16_bytes() {
+        let bytes = [3u8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let (sel, consumed) = Selection::decode_serialized(&bytes).unwrap();
+        assert_eq!(sel, Selection::All);
+        assert_eq!(consumed, 16);
+        assert_eq!(sel.iter_linear_1d(4).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn decode_regular_hyperslab_matches_vds_fixture() {
+        // Exact virtual selection for src_a in the VDS fixture:
+        // start=0 stride=1 count=1 block=4, version 3, enc_size 2, rank 1.
+        let bytes = [
+            0x02, 0, 0, 0, // type = HYPER
+            0x03, 0, 0, 0, // version 3
+            0x01, // flags = regular
+            0x02, // enc_size = 2
+            0x01, 0, 0, 0, // rank = 1
+            0x00, 0x00, // start
+            0x01, 0x00, // stride
+            0x01, 0x00, // count
+            0x04, 0x00, // block
+        ];
+        let (sel, consumed) = Selection::decode_serialized(&bytes).unwrap();
+        assert_eq!(consumed, 22);
+        assert_eq!(
+            sel,
+            Selection::Hyperslab {
+                start: vec![0],
+                stride: vec![1],
+                count: vec![1],
+                block: vec![4],
+            }
+        );
+        assert_eq!(sel.iter_linear_1d(8).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn decode_hyperslab_start4() {
+        let bytes = [
+            0x02, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, //
+            0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x04, 0x00,
+        ];
+        let (sel, _) = Selection::decode_serialized(&bytes).unwrap();
+        assert_eq!(sel.iter_linear_1d(8).unwrap(), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn decode_strided_hyperslab_iter() {
+        // start=1 stride=3 count=2 block=2 => 1,2, 4,5
+        let bytes = [
+            0x02, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0x01, 0, 0, 0, //
+            0x01, 0x00, 0x03, 0x00, 0x02, 0x00, 0x02, 0x00,
+        ];
+        let (sel, _) = Selection::decode_serialized(&bytes).unwrap();
+        assert_eq!(sel.iter_linear_1d(8).unwrap(), vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn decode_nd_hyperslab_iter_rejected() {
+        let bytes = [
+            0x02, 0, 0, 0, 0x03, 0, 0, 0, 0x01, 0x02, 0x02, 0, 0, 0, // rank 2
+            0, 0, 1, 0, 1, 0, 2, 0, 0, 0, 1, 0, 1, 0, 2, 0,
+        ];
+        let (sel, _) = Selection::decode_serialized(&bytes).unwrap();
+        assert!(sel.iter_linear_1d(16).is_err());
+    }
+
+    #[test]
+    fn decode_irregular_hyperslab_rejected() {
+        let bytes = [0x02u8, 0, 0, 0, 0x03, 0, 0, 0, 0x00, 0x02, 0x01, 0, 0, 0];
+        assert!(Selection::decode_serialized(&bytes).is_err());
     }
 }

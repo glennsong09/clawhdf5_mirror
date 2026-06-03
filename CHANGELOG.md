@@ -14,6 +14,19 @@
   previously unsupported. Signed and unsigned reduced-precision integers and
   float members all read end-to-end, validated against HDF5 2.0.
 
+### New Features
+- `clawhdf5-format`: assemble **1-D, same-file Virtual Datasets (VDS)**.
+  Previously a virtual layout returned `UnsupportedVersion`. The reader now
+  decodes the global-heap mapping block (reverse-engineered against HDF5 2.0:
+  `version · nused · [source-file · source-dataset · source-selection ·
+  virtual-selection]* · checksum`, including the block-version-1 same-file
+  marker), decodes the `H5S` source/virtual dataspace **selections** (ALL,
+  NONE, and version-3 regular hyperslabs), reads each same-file source dataset,
+  and scatters its selected elements into the virtual buffer; unmapped regions
+  are left at the zero fill value. External-file sources and N-dimensional
+  selections return a clean unsupported error. The previous `parse_vds_mappings`
+  used a guessed layout that did not match real files and is replaced.
+
 ### Bug Fixes
 - `clawhdf5-format`: read **paged Fixed Array** chunk indexes. A filtered,
   fixed-dimension dataset with more than one data-block page (>1024 chunks by

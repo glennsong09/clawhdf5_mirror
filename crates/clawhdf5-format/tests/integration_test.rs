@@ -663,6 +663,22 @@ fn v4_fixed_array_read() {
 }
 
 #[test]
+fn v4_virtual_dataset_same_file_read() {
+    // A 1-D virtual dataset assembled from two same-file sources:
+    //   virt[0:4]  <- src_a[1:5]  (partial source hyperslab) => 11,12,13,14
+    //   virt[4:8]  <- (unmapped)                              => fill 0
+    //   virt[8:12] <- src_b[0:4]  (ALL)                       => 20,21,22,23
+    let file_data = include_bytes!("fixtures/vds_same_file.h5");
+    let (raw, datatype, _) = read_chunked_dataset(file_data, "virt");
+    let values = read_as_i32(&raw, &datatype).unwrap();
+    assert_eq!(
+        values,
+        vec![11, 12, 13, 14, 0, 0, 0, 0, 20, 21, 22, 23],
+        "VDS assembly (partial source slice + fill gap) mismatch"
+    );
+}
+
+#[test]
 fn v4_paged_fixed_array_read() {
     // 1025 chunks of 16 int32s, gzip-filtered => Fixed Array index whose data
     // block is *paged* (page holds 1024 elements). Page 0 is full, page 1 holds
