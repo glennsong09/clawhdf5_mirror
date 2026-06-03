@@ -170,9 +170,11 @@ ClawhDF5's agent memory engine implements research from 15+ recent papers on age
 | **`vector_search`** | Flat cosine, pre-normed, SIMD, BLAS, GPU, parallel search paths |
 | **`ivf` / `pq`** | IVF-PQ approximate nearest neighbor for billion-scale search |
 | **`bm25`** | BM25 keyword index with TF-IDF scoring |
+| **`entity_extract`** | Rule-based entity extraction from text chunks into the knowledge graph |
 | **`wal`** | Write-ahead log for crash-safe persistence |
 | **`memory_strategy`** | Pluggable strategies: save-every, semantic-shift, user-correction detection |
 | **`decision_gate`** | Sub-microsecond trivial/substantive classification |
+| **`async_memory`** | Tokio-based async wrapper over the memory store (`async` feature) |
 
 ---
 
@@ -369,6 +371,7 @@ ClawhDF5's agent memory design draws from 15+ recent papers:
 |------|---------|-------------|
 | `agent` | no | Full agent memory layer |
 | `float16` | **yes** | Half-precision embedding storage (2× compression) |
+| `hnsw` | **yes** | HNSW approximate vector index for `hybrid_search` (via `clawhdf5-ann`); disable for an exact linear scan |
 | `parallel` | no | Rayon parallel search |
 | `fast-math` | no | BLAS matrix-vector multiply |
 | `accelerate` | no | Apple Accelerate / AMX (macOS) |
@@ -384,7 +387,14 @@ ClawhDF5's agent memory design draws from 15+ recent papers:
 | `deflate` | yes | Deflate compression |
 | `checksum` | yes | Jenkins lookup3 verification |
 | `provenance` | yes | SHA-256 provenance attributes |
-| `parallel` | no | Parallel chunk encoding (rayon) |
+| `fast-deflate` | **yes** | zlib-ng backend for faster deflate |
+| `system-zlib-decompress` | **yes** | Use the system zlib for decompression where available |
+| `parallel` | no | Parallel chunk encoding + compression (rayon) |
+| `fast-checksum` | no | crc32fast-accelerated checksums |
+| `lz4` | no | LZ4 block compression filter (id 32004) |
+| `zstd` | no | Zstandard compression filter (id 32015) |
+| `system-zlib` / `zlib-rs` | no | Alternative zlib backends for deflate |
+| `blake3_hash` | no | BLAKE3 content hashing for provenance |
 
 ---
 
