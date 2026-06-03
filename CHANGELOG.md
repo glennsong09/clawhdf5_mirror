@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### New Features
+- `clawhdf5-format`: decode the **scale-offset filter** (id 6), integer variant
+  (`H5Z_SO_INT`) — previously unsupported. Handles signed/unsigned element
+  sizes, negative minima and fill values; the on-disk format was reverse-
+  engineered against HDF5 2.0 and validated end-to-end. Floating-point
+  scale-offset (D-scale/E-scale) remains unsupported.
+
 ### Bug Fixes
 - `clawhdf5-format`: read datasets written by modern HDF5 (1.14+/2.0, i.e.
   `libver=latest`). Compound (class 6) and array (class 10) datatype **version 5**
