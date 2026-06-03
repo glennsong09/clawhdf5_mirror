@@ -16,6 +16,12 @@
   compound/array N-Bit layouts remain unsupported.
 
 ### Bug Fixes
+- `clawhdf5-format`: **sign-extend reduced-precision fixed-point integers** on
+  read. A signed integer whose datatype precision is smaller than its storage
+  size is stored zero-filled, so e.g. a 16-bit-precision `-1` previously read as
+  `65535`. The integer read paths now extract the precision field and
+  sign-extend (full-width types are unchanged). Completes signed N-Bit reads and
+  also fixes un-filtered reduced-precision integer datasets.
 - `clawhdf5-format`: read datasets written by modern HDF5 (1.14+/2.0, i.e.
   `libver=latest`). Compound (class 6) and array (class 10) datatype **version 5**
   messages and data layout **version 5** messages were rejected as invalid; they
