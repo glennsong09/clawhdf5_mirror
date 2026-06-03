@@ -82,7 +82,7 @@ BM25-only baseline (no embedding model required at bench time):
 | MRR (session) | ~0.34 | Higher |
 | Abstention accuracy | ~72% | — |
 
-> ¹ Enable embeddings via `hybrid_search(query_emb, text, 0.7, 0.3, k)` for substantially higher recall.
+> ¹ Enable embeddings via `hybrid_search(query_emb, text, 0.7, 0.3, k)` for substantially higher recall. The vector stage is served by the HNSW index by default (the `hnsw` feature is on by default); build with `--no-default-features --features float16` to fall back to an exact linear cosine scan.
 
 ### Memory Footprint
 
@@ -159,7 +159,7 @@ ClawhDF5's agent memory engine implements research from 15+ recent papers on age
 |--------|-------------|
 | **`knowledge`** | Entity/relation graph with BFS traversal, spreading activation, fuzzy entity resolution |
 | **`consolidation`** | Three-tier memory (Working → Episodic → Semantic) with importance scoring and time-decay |
-| **`hybrid`** | Vector + BM25 fusion with Reciprocal Rank Fusion (RRF, k=60) |
+| **`hybrid`** | Vector + BM25 fusion with Reciprocal Rank Fusion (RRF, k=60). The vector stage uses the HNSW index by default (`hnsw` feature, on by default); disable with `--no-default-features --features float16` for an exact linear scan |
 | **`reranker`** | Multi-factor re-ranking: temporal recency, source authority, activation weight |
 | **`confidence`** | Low-confidence rejection — suppresses spurious recalls when nothing matches |
 | **`temporal`** | Sorted timestamp index, session DAG, entity timeline, temporal query hints |
