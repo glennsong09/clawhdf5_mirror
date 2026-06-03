@@ -298,71 +298,219 @@ fn write_elements(values: &[i64], elem_size: usize, big_endian: bool) -> Vec<u8>
     out
 }
 
-/// Decode the HDF5 N-Bit filter (id 5), atomic (integer/float) variant.
+/// A node of the N-Bit datatype tree (reconstructed from the filter's client
+/// data) describing how one element is bit-packed.
+enum NbitNode {
+    /// Leaf: `precision` significant bits at `bit_offset` of a `size`-byte field.
+    Atomic {
+        size: usize,
+        big_endian: bool,
+        precision: u32,
+        bit_offset: u32,
+    },
+    /// Fixed-size struct of members, each at a byte offset within the element.
+    Compound {
+        size: usize,
+        members: Vec<(usize, NbitNode)>,
+    },
+    /// `count` consecutive copies of `base`, each `base_size` bytes apart.
+    Array {
+        base: Box<NbitNode>,
+        count: usize,
+        base_size: usize,
+    },
+}
+
+impl NbitNode {
+    fn byte_size(&self) -> usize {
+        match self {
+            NbitNode::Atomic { size, .. } => *size,
+            NbitNode::Compound { size, .. } => *size,
+            NbitNode::Array {
+                count, base_size, ..
+            } => count * base_size,
+        }
+    }
+}
+
+fn nbit_cd(cd: &[u32], i: usize) -> Result<u32, FormatError> {
+    cd.get(i)
+        .copied()
+        .ok_or_else(|| FormatError::ChunkedReadError("nbit: truncated client data".into()))
+}
+
+/// Parse one N-Bit type node from the client-data tree, advancing `idx`.
+fn parse_nbit_node(cd: &[u32], idx: &mut usize) -> Result<NbitNode, FormatError> {
+    const ATOMIC: u32 = 1;
+    const ARRAY: u32 = 2;
+    const COMPOUND: u32 = 3;
+    let class = nbit_cd(cd, *idx)?;
+    match class {
+        ATOMIC => {
+            // class, size, byte order, precision, bit offset
+            let size = nbit_cd(cd, *idx + 1)? as usize;
+            let big_endian = nbit_cd(cd, *idx + 2)? == 1;
+            let precision = nbit_cd(cd, *idx + 3)?;
+            let bit_offset = nbit_cd(cd, *idx + 4)?;
+            *idx += 5;
+            if size == 0 || size > 8 || precision == 0 || bit_offset + precision > (size * 8) as u32
+            {
+                return Err(FormatError::ChunkedReadError(
+                    "nbit: invalid atomic parameters".into(),
+                ));
+            }
+            Ok(NbitNode::Atomic {
+                size,
+                big_endian,
+                precision,
+                bit_offset,
+            })
+        }
+        ARRAY => {
+            // class, total size, base type node
+            let total = nbit_cd(cd, *idx + 1)? as usize;
+            *idx += 2;
+            let base = parse_nbit_node(cd, idx)?;
+            let base_size = base.byte_size();
+            if base_size == 0 || !total.is_multiple_of(base_size) {
+                return Err(FormatError::ChunkedReadError(
+                    "nbit: invalid array layout".into(),
+                ));
+            }
+            Ok(NbitNode::Array {
+                count: total / base_size,
+                base_size,
+                base: Box::new(base),
+            })
+        }
+        COMPOUND => {
+            // class, total size, member count, (member byte offset, node)*
+            let total = nbit_cd(cd, *idx + 1)? as usize;
+            let nmembers = nbit_cd(cd, *idx + 2)? as usize;
+            *idx += 3;
+            let mut members = Vec::with_capacity(nmembers);
+            for _ in 0..nmembers {
+                let moff = nbit_cd(cd, *idx)? as usize;
+                *idx += 1;
+                let node = parse_nbit_node(cd, idx)?;
+                if moff + node.byte_size() > total {
+                    return Err(FormatError::ChunkedReadError(
+                        "nbit: member exceeds compound size".into(),
+                    ));
+                }
+                members.push((moff, node));
+            }
+            Ok(NbitNode::Compound {
+                size: total,
+                members,
+            })
+        }
+        // Class 4 is H5Z_NBIT_NOOPTYPE (members copied verbatim) — not seen in
+        // practice for the supported leaf types and left unsupported.
+        _ => Err(FormatError::UnsupportedFilter(FILTER_NBIT)),
+    }
+}
+
+/// MSB-first bit reader over the packed N-Bit stream.
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl BitReader<'_> {
+    fn read(&mut self, nbits: u32) -> Result<u64, FormatError> {
+        let mut value = 0u64;
+        for _ in 0..nbits {
+            let byte = *self.data.get(self.pos / 8).ok_or_else(|| {
+                FormatError::ChunkedReadError("nbit: packed data too short".into())
+            })?;
+            let bit = (byte >> (7 - (self.pos % 8))) & 1;
+            value = (value << 1) | bit as u64;
+            self.pos += 1;
+        }
+        Ok(value)
+    }
+}
+
+/// Decode one element node into `elem[base..]` (the rest stays zero-filled).
+fn decode_nbit_node(
+    node: &NbitNode,
+    br: &mut BitReader,
+    elem: &mut [u8],
+    base: usize,
+) -> Result<(), FormatError> {
+    match node {
+        NbitNode::Atomic {
+            size,
+            big_endian,
+            precision,
+            bit_offset,
+        } => {
+            let value = br.read(*precision)? << bit_offset;
+            let le = value.to_le_bytes();
+            let dst = &mut elem[base..base + size];
+            if *big_endian {
+                for (j, slot) in dst.iter_mut().enumerate() {
+                    *slot = le[size - 1 - j];
+                }
+            } else {
+                dst.copy_from_slice(&le[..*size]);
+            }
+        }
+        NbitNode::Compound { members, .. } => {
+            for (moff, child) in members {
+                decode_nbit_node(child, br, elem, base + moff)?;
+            }
+        }
+        NbitNode::Array {
+            base: bnode,
+            count,
+            base_size,
+        } => {
+            for i in 0..*count {
+                decode_nbit_node(bnode, br, elem, base + i * base_size)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode the HDF5 N-Bit filter (id 5).
 ///
-/// N-Bit strips the unused leading/trailing bits of a datatype whose precision
-/// is smaller than its storage size and packs the significant `precision` bits
-/// of each element MSB-first, contiguously, with no header. Decompression
-/// reverses this: it reads `precision` bits per element and places them at bit
-/// `offset` of a zero-filled `size`-byte element — which is exactly HDF5's
-/// canonical on-disk layout for a reduced-precision value (the high bits are
-/// zero; sign extension of signed reduced-precision integers is the datatype
-/// reader's responsibility, as it is for un-filtered reduced-precision data).
-///
-/// `cd` is the `H5Znbit.c` parameter block: `[2]`=element count,
-/// `[3]`=type class (1 = atomic), and for atomics `[4]`=storage size,
-/// `[5]`=byte order (1 = big-endian), `[6]`=precision (bits), `[7]`=bit offset.
-/// The recursive compound/array layouts are reported as unsupported.
+/// N-Bit strips the unused leading/trailing bits of each (possibly nested)
+/// datatype field and packs the significant `precision` bits MSB-first,
+/// contiguously, with no header. The filter's client data carries a recursive
+/// type tree — atomic (`[1, size, order, precision, offset]`), array
+/// (`[2, total_size, <base>]`) and compound
+/// (`[3, total_size, nmembers, (offset, <node>)*]`) — preceded by
+/// `[nparms, flag, nelmts]`. Decompression walks the tree once per element,
+/// placing each field's bits at its byte/bit offset in a zero-filled element
+/// (HDF5's canonical reduced-precision layout). Sign-extension of reduced
+/// precision signed integers is the datatype reader's job. Atomic floats are
+/// encoded as full-precision atomics and handled transparently.
 fn nbit_decompress(data: &[u8], cd: &[u32]) -> Result<Vec<u8>, FormatError> {
-    const H5Z_NBIT_ATOMIC: u32 = 1;
-    if cd.len() < 8 {
+    if cd.len() < 4 {
         return Err(FormatError::ChunkedReadError(
             "nbit: missing filter client data".into(),
         ));
     }
     let nelmts = cd[2] as usize;
-    if cd[3] != H5Z_NBIT_ATOMIC {
-        // Compound/array N-Bit layouts encode a recursive parameter tree.
-        return Err(FormatError::UnsupportedFilter(FILTER_NBIT));
-    }
-    let size = cd[4] as usize;
-    let big_endian = cd[5] == 1;
-    let precision = cd[6] as usize;
-    let offset = cd[7] as usize;
-    if size == 0 || size > 8 || precision == 0 || offset + precision > size * 8 {
+    let mut idx = 3;
+    let root = parse_nbit_node(cd, &mut idx)?;
+    let elem_size = root.byte_size();
+    if elem_size == 0 {
         return Err(FormatError::ChunkedReadError(
-            "nbit: invalid atomic parameters".into(),
+            "nbit: zero element size".into(),
         ));
     }
 
-    let need_bits = nelmts
-        .checked_mul(precision)
+    let total = nelmts
+        .checked_mul(elem_size)
         .ok_or_else(|| FormatError::ChunkedReadError("nbit: size overflow".into()))?;
-    if data.len() * 8 < need_bits {
-        return Err(FormatError::ChunkedReadError(
-            "nbit: packed data too short".into(),
-        ));
-    }
-
-    let mut out = vec![0u8; nelmts * size];
-    let mut bitpos = 0usize;
-    for elem in out.chunks_exact_mut(size) {
-        // Read `precision` bits MSB-first into the significant value.
-        let mut value: u64 = 0;
-        for _ in 0..precision {
-            let bit = (data[bitpos / 8] >> (7 - (bitpos % 8))) & 1;
-            value = (value << 1) | bit as u64;
-            bitpos += 1;
-        }
-        // Place the value at its bit offset; the rest of the element stays zero.
-        let le = (value << offset).to_le_bytes();
-        if big_endian {
-            for (j, slot) in elem.iter_mut().enumerate() {
-                *slot = le[size - 1 - j];
-            }
-        } else {
-            elem.copy_from_slice(&le[..size]);
-        }
+    let mut out = vec![0u8; total];
+    let mut br = BitReader { data, pos: 0 };
+    for elem in out.chunks_exact_mut(elem_size) {
+        decode_nbit_node(&root, &mut br, elem, 0)?;
     }
     Ok(out)
 }
@@ -1138,12 +1286,48 @@ mod tests {
     }
 
     #[test]
-    fn nbit_compound_unsupported() {
-        // class != 1 (atomic) is the recursive compound/array layout.
-        let cd = [8u32, 0, 4, 2, 4, 0, 16, 0];
-        assert!(matches!(
-            nbit_decompress(&[0u8; 8], &cd),
-            Err(FormatError::UnsupportedFilter(FILTER_NBIT))
-        ));
+    fn nbit_compound_int_members() {
+        // Compound { a: i32@0 prec 16, b: u32@4 prec 8 }, 3 elements.
+        // data = [(-1,200),(1000,7),(-32768,255)]. Captured from HDF5 2.0.
+        let cd = [18u32, 0, 3, 3, 8, 2, 0, 1, 4, 0, 16, 0, 4, 1, 4, 0, 8, 0];
+        let raw = [0xff, 0xff, 0xc8, 0x03, 0xe8, 0x07, 0x80, 0x00, 0xff, 0x00];
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0xff,0xff,0x00,0x00, 0xc8,0x00,0x00,0x00, // (-1, 200)
+            0xe8,0x03,0x00,0x00, 0x07,0x00,0x00,0x00, // (1000, 7)
+            0x00,0x80,0x00,0x00, 0xff,0x00,0x00,0x00, // (-32768, 255)
+        ];
+        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+    }
+
+    #[test]
+    fn nbit_compound_with_array_member() {
+        // Compound { a: array(2,) of i32 prec 16 @0; b: u32@8 prec 8 }, 2 elements.
+        // data = [([-1,100],200), ([1000,-32768],7)].
+        let cd = [20u32, 0, 2, 3, 12, 2, 0, 2, 8, 1, 4, 0, 16, 0, 8, 1, 4, 0, 8, 0];
+        let raw = [0xff, 0xff, 0x00, 0x64, 0xc8, 0x03, 0xe8, 0x80, 0x00, 0x07, 0x00];
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0xff,0xff,0x00,0x00, 0x64,0x00,0x00,0x00, 0xc8,0x00,0x00,0x00, // ([-1,100], 200)
+            0xe8,0x03,0x00,0x00, 0x00,0x80,0x00,0x00, 0x07,0x00,0x00,0x00, // ([1000,-32768], 7)
+        ];
+        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
+    }
+
+    #[test]
+    fn nbit_compound_with_float_member() {
+        // Compound { i: i32@0 prec 16; f: f32@4 prec 32 }, 2 elements.
+        // data = [(-1, 1.5), (100, -2.5)]. The float member is a full-precision
+        // atomic; its bits are packed MSB-first and restored to LE storage.
+        let cd = [18u32, 0, 2, 3, 8, 2, 0, 1, 4, 0, 16, 0, 4, 1, 4, 0, 32, 0];
+        let raw = [
+            0xff, 0xff, 0x3f, 0xc0, 0x00, 0x00, 0x00, 0x64, 0xc0, 0x20, 0x00, 0x00, 0x00,
+        ];
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0xff,0xff,0x00,0x00, 0x00,0x00,0xc0,0x3f, // (-1, 1.5)
+            0x64,0x00,0x00,0x00, 0x00,0x00,0x20,0xc0, // (100, -2.5)
+        ];
+        assert_eq!(nbit_decompress(&raw, &cd).unwrap(), expected);
     }
 }
