@@ -696,6 +696,62 @@ fn v4_virtual_dataset_2d_same_file_read() {
 }
 
 #[test]
+fn v4_virtual_dataset_external_file_read() {
+    use clawhdf5_format::data_read::read_raw_data_full_with_resolver;
+    // The virtual file maps virt[0:8] <- (external) ext_src.h5:/data = [10..17].
+    let virt = include_bytes!("fixtures/vds_external_virt.h5");
+    let src = include_bytes!("fixtures/vds_external_src.h5").to_vec();
+
+    let sig = find_signature(virt).unwrap();
+    let sb = Superblock::parse(virt, sig).unwrap();
+    let addr = resolve_path_any(virt, &sb, "virt").unwrap();
+    let hdr = ObjectHeader::parse(virt, addr as usize, sb.offset_size, sb.length_size).unwrap();
+    let ds = Dataspace::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data,
+        sb.length_size,
+    )
+    .unwrap();
+    let (dt, _) = Datatype::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data,
+    )
+    .unwrap();
+    let layout = DataLayout::parse(
+        &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data,
+        sb.offset_size,
+        sb.length_size,
+    )
+    .unwrap();
+
+    // Resolver supplies the external source file's bytes by its stored name.
+    let resolver = |name: &str| -> Option<Vec<u8>> {
+        if name == "ext_src.h5" {
+            Some(src.clone())
+        } else {
+            None
+        }
+    };
+    let raw = read_raw_data_full_with_resolver(
+        virt,
+        &layout,
+        &ds,
+        &dt,
+        None,
+        sb.offset_size,
+        sb.length_size,
+        Some(&resolver),
+    )
+    .unwrap();
+    let values = read_as_i32(&raw, &dt).unwrap();
+    assert_eq!(values, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+
+    // With no resolver, an external source is a clean error (not wrong data).
+    let no_resolver = read_raw_data_full_with_resolver(
+        virt, &layout, &ds, &dt, None, sb.offset_size, sb.length_size, None,
+    );
+    assert!(no_resolver.is_err());
+}
+
+#[test]
 fn v4_paged_fixed_array_read() {
     // 1025 chunks of 16 int32s, gzip-filtered => Fixed Array index whose data
     // block is *paged* (page holds 1024 elements). Page 0 is full, page 1 holds

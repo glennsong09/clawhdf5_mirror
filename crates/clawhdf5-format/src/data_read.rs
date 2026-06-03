@@ -73,6 +73,16 @@ pub fn read_raw_data(
     read_raw_data_full(file_data, layout, dataspace, datatype, None, 8, 8)
 }
 
+/// Resolves a Virtual Dataset source **file name** (as stored in the mapping,
+/// e.g. `"ext_src.h5"`) to that file's raw bytes.
+///
+/// The pure-byte read API has no filesystem of its own, so external-file VDS
+/// sources are read through a caller-supplied resolver. The std file API wires
+/// one that reads relative to the virtual file's directory; callers can supply
+/// their own (e.g. an in-memory map) in `no_std` builds. Returning `None` means
+/// the source file is unavailable and the mapping is skipped.
+pub type VdsSourceResolver<'a> = dyn Fn(&str) -> Option<Vec<u8>> + 'a;
+
 /// Read raw bytes with full parameters including filter pipeline and sizes.
 pub fn read_raw_data_full(
     file_data: &[u8],
@@ -82,6 +92,40 @@ pub fn read_raw_data_full(
     pipeline: Option<&FilterPipeline>,
     offset_size: u8,
     length_size: u8,
+) -> Result<Vec<u8>, FormatError> {
+    read_raw_data_full_impl(
+        file_data, layout, dataspace, datatype, pipeline, offset_size, length_size, None,
+    )
+}
+
+/// Like [`read_raw_data_full`], but with a resolver for external-file Virtual
+/// Dataset sources. For non-virtual layouts the resolver is ignored.
+#[allow(clippy::too_many_arguments)]
+pub fn read_raw_data_full_with_resolver(
+    file_data: &[u8],
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+    resolver: Option<&VdsSourceResolver>,
+) -> Result<Vec<u8>, FormatError> {
+    read_raw_data_full_impl(
+        file_data, layout, dataspace, datatype, pipeline, offset_size, length_size, resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_raw_data_full_impl(
+    file_data: &[u8],
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+    resolver: Option<&VdsSourceResolver>,
 ) -> Result<Vec<u8>, FormatError> {
     let num_elements = dataspace.num_elements() as usize;
     let elem_size = datatype.type_size() as usize;
@@ -140,6 +184,7 @@ pub fn read_raw_data_full(
             datatype,
             offset_size,
             length_size,
+            resolver,
         ),
     }
 }
@@ -385,14 +430,17 @@ pub fn read_raw_data_selection(
 
 /// Assemble a **Virtual Dataset (VDS)** from its source mappings.
 ///
-/// Supports **same-file** virtual datasets of any rank: each mapping's source
-/// dataset is read from the same file and its selected elements are scattered
-/// into the virtual buffer at the positions given by the virtual selection
-/// (both enumerated in row-major order, as HDF5 pairs them). Unmapped regions
-/// are left at the zero fill value.
+/// Supports virtual datasets of any rank. Same-file sources are read directly;
+/// **external-file** sources are read through the caller-supplied `resolver`,
+/// which maps a stored source file name to that file's bytes. Each mapping's
+/// selected source elements are scattered into the virtual buffer at the
+/// positions given by the virtual selection (both enumerated in row-major
+/// order, as HDF5 pairs them). Unmapped regions are left at the zero fill value.
 ///
-/// External-file sources are reported as unsupported rather than silently
-/// producing wrong data.
+/// A mapping whose external source file the resolver cannot supply (`None`) is
+/// skipped, leaving its region at fill — matching HDF5's tolerance of missing
+/// sources. An external source with no resolver at all is a hard error.
+#[allow(clippy::too_many_arguments)]
 fn read_virtual_data(
     file_data: &[u8],
     global_heap_address: Option<u64>,
@@ -401,6 +449,7 @@ fn read_virtual_data(
     datatype: &Datatype,
     offset_size: u8,
     length_size: u8,
+    resolver: Option<&VdsSourceResolver>,
 ) -> Result<Vec<u8>, FormatError> {
     use crate::data_layout::parse_vds_mappings;
     use crate::global_heap::GlobalHeapCollection;
@@ -425,18 +474,33 @@ fn read_virtual_data(
     let mappings = parse_vds_mappings(&obj.data, length_size)?;
 
     for m in &mappings {
-        // Only same-file sources are reachable through the pure-byte read API.
-        if !(m.source_file.is_empty() || m.source_file == ".") {
-            return Err(FormatError::ChunkedReadError(
-                "external-file virtual dataset sources are not supported".into(),
-            ));
-        }
+        let same_file = m.source_file.is_empty() || m.source_file == ".";
+
+        // Resolve the bytes of the file holding this source dataset.
+        let external;
+        let src_file_data: &[u8] = if same_file {
+            file_data
+        } else {
+            let r = resolver.ok_or_else(|| {
+                FormatError::ChunkedReadError(
+                    "external-file virtual dataset sources require a file resolver".into(),
+                )
+            })?;
+            match r(&m.source_file) {
+                Some(bytes) => {
+                    external = bytes;
+                    &external
+                }
+                // Source file unavailable: leave this region at fill value.
+                None => continue,
+            }
+        };
 
         let (vsel, _) = Selection::decode_serialized(&m.virtual_selection)?;
         let (ssel, _) = Selection::decode_serialized(&m.source_selection)?;
 
         let (src_raw, src_dims) =
-            read_named_dataset_raw(file_data, &m.source_dataset, offset_size, length_size)?;
+            read_named_dataset_raw(src_file_data, &m.source_dataset, offset_size, length_size)?;
 
         let vidx = vsel.iter_linear(virtual_dims)?;
         let sidx = ssel.iter_linear(&src_dims)?;

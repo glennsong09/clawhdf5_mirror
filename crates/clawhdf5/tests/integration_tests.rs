@@ -707,6 +707,38 @@ fn fletcher32_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn virtual_dataset_external_file_auto_resolved() {
+    // The facade resolves external Virtual Dataset sources relative to the
+    // opened file's directory automatically. Drop both files side by side in a
+    // temp dir and open the virtual one through the public File API.
+    let virt = include_bytes!("../../clawhdf5-format/tests/fixtures/vds_external_virt.h5");
+    let src = include_bytes!("../../clawhdf5-format/tests/fixtures/vds_external_src.h5");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ext_src.h5"), src).unwrap();
+    let virt_path = dir.path().join("ext_virt.h5");
+    std::fs::write(&virt_path, virt).unwrap();
+
+    let file = File::open(&virt_path).unwrap();
+    let values = file.dataset("virt").unwrap().read_i32().unwrap();
+    assert_eq!(values, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+}
+
+#[test]
+fn virtual_dataset_external_missing_source_is_fill() {
+    // If the external source file is absent, its region reads as the zero fill
+    // value rather than erroring.
+    let virt = include_bytes!("../../clawhdf5-format/tests/fixtures/vds_external_virt.h5");
+    let dir = tempfile::tempdir().unwrap();
+    let virt_path = dir.path().join("ext_virt.h5");
+    std::fs::write(&virt_path, virt).unwrap();
+
+    let file = File::open(&virt_path).unwrap();
+    let values = file.dataset("virt").unwrap().read_i32().unwrap();
+    assert_eq!(values, vec![0; 8]);
+}
+
+#[test]
 fn same_dataset_name_in_different_groups() {
     let mut b = FileBuilder::new();
 

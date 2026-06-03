@@ -66,6 +66,9 @@ pub struct File {
     superblock: Superblock,
     /// Per-file chunk cache shared across all dataset reads.
     chunk_cache: ChunkCache,
+    /// Directory the file was opened from, used to resolve external Virtual
+    /// Dataset source files relative to this file. `None` for in-memory files.
+    base_dir: Option<std::path::PathBuf>,
 }
 
 impl File {
@@ -74,6 +77,7 @@ impl File {
     /// When the `mmap` feature is enabled (default), this uses memory-mapped
     /// I/O.  Otherwise it reads the entire file into a `Vec<u8>`.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let base_dir = path.as_ref().parent().map(|p| p.to_path_buf());
         #[cfg(feature = "mmap")]
         {
             let reader = clawhdf5_io::MmapReader::open(path).map_err(Error::Io)?;
@@ -84,12 +88,15 @@ impl File {
                 data: FileData::Mmap(reader),
                 superblock,
                 chunk_cache: ChunkCache::new(),
+                base_dir,
             })
         }
         #[cfg(not(feature = "mmap"))]
         {
             let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-            Self::from_bytes(bytes)
+            let mut f = Self::from_bytes(bytes)?;
+            f.base_dir = base_dir;
+            Ok(f)
         }
     }
 
@@ -99,10 +106,15 @@ impl File {
     /// undesirable (e.g. network filesystems, very small files, etc.).
     pub fn open_buffered<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-        Self::from_bytes(bytes)
+        let mut f = Self::from_bytes(bytes)?;
+        f.base_dir = path.as_ref().parent().map(|p| p.to_path_buf());
+        Ok(f)
     }
 
     /// Open an HDF5 file from an in-memory byte vector.
+    ///
+    /// In-memory files have no directory, so external Virtual Dataset sources
+    /// cannot be resolved automatically (same-file VDS still works).
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
         let sig_offset = signature::find_signature(&data)?;
         let superblock = Superblock::parse(&data, sig_offset)?;
@@ -110,6 +122,7 @@ impl File {
             data: FileData::Owned(data),
             superblock,
             chunk_cache: ChunkCache::new(),
+            base_dir: None,
         })
     }
 
@@ -710,6 +723,28 @@ impl<'f> Dataset<'f> {
         let ds = self.dataspace()?;
         let dl = self.data_layout()?;
         let pipeline = self.filter_pipeline();
+
+        // Virtual datasets are assembled from source datasets; the per-file
+        // chunk cache does not apply. Route them through the resolver path so
+        // external sibling files resolve relative to this file's directory.
+        if matches!(dl, DataLayout::Virtual { .. }) {
+            let base_dir = self.file.base_dir.clone();
+            let resolver = move |name: &str| -> Option<Vec<u8>> {
+                let dir = base_dir.as_ref()?;
+                std::fs::read(dir.join(name)).ok()
+            };
+            return Ok(data_read::read_raw_data_full_with_resolver(
+                self.file.data.as_bytes(),
+                &dl,
+                &ds,
+                &dt,
+                pipeline.as_ref(),
+                self.file.offset_size(),
+                self.file.length_size(),
+                Some(&resolver),
+            )?);
+        }
+
         Ok(data_read::read_raw_data_cached(
             self.file.data.as_bytes(),
             &dl,

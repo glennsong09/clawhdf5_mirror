@@ -15,6 +15,17 @@
   float members all read end-to-end, validated against HDF5 2.0.
 
 ### New Features
+- `clawhdf5` / `clawhdf5-format`: read **external-file Virtual Datasets (VDS)**.
+  The format layer gains `read_raw_data_full_with_resolver` and a
+  `VdsSourceResolver` callback (`Fn(&str) -> Option<Vec<u8>>`) that maps a
+  stored source file name to its bytes, so the pure-byte reader can pull in
+  external sources without a filesystem of its own. The `clawhdf5` `File` API
+  wires a default resolver that reads sibling source files relative to the
+  opened file's directory, so `File::open(...).dataset(...).read_*()` now
+  transparently assembles cross-file VDS. A source file the resolver cannot
+  supply leaves its region at the fill value (matching HDF5); an external
+  source with no resolver at all is a clean error. In-memory files
+  (`File::from_bytes`) have no directory, so only same-file VDS resolves there.
 - `clawhdf5-format`: assemble **same-file Virtual Datasets (VDS)** of any rank.
   Previously a virtual layout returned `UnsupportedVersion`. The reader now
   decodes the global-heap mapping block (reverse-engineered against HDF5 2.0:
