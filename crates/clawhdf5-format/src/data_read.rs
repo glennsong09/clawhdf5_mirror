@@ -618,6 +618,11 @@ fn get_size(dt: &Datatype) -> usize {
 
 /// Convert raw bytes to `f64` values.
 pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatError> {
+    // Array datatypes (e.g. an array-typed compound member) are read as a flat
+    // sequence of their base elements.
+    if let Datatype::Array { base_type, .. } = datatype {
+        return read_as_f64(raw, base_type);
+    }
     ensure_numeric(datatype, "FloatingPoint or FixedPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -701,6 +706,9 @@ fn convert_to_f64(
 
 /// Convert raw bytes to `i64` values.
 pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatError> {
+    if let Datatype::Array { base_type, .. } = datatype {
+        return read_as_i64(raw, base_type);
+    }
     ensure_numeric(datatype, "FixedPoint (signed)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -745,6 +753,9 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
 
 /// Convert raw bytes to `u64` values.
 pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatError> {
+    if let Datatype::Array { base_type, .. } = datatype {
+        return read_as_u64(raw, base_type);
+    }
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -767,6 +778,9 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
 
 /// Convert raw bytes to `f32` values.
 pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatError> {
+    if let Datatype::Array { base_type, .. } = datatype {
+        return read_as_f32(raw, base_type);
+    }
     ensure_numeric(datatype, "FloatingPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -841,6 +855,9 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
 
 /// Convert raw bytes to `i32` values.
 pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatError> {
+    if let Datatype::Array { base_type, .. } = datatype {
+        return read_as_i32(raw, base_type);
+    }
     ensure_numeric(datatype, "FixedPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -1471,6 +1488,28 @@ mod tests {
         let dt = reduced_int(true, 32);
         let raw: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff, 0x2a, 0x00, 0x00, 0x00];
         assert_eq!(read_as_i32(&raw, &dt).unwrap(), vec![-1, 42]);
+    }
+
+    #[test]
+    fn array_datatype_reads_flat_base_elements() {
+        // An array-typed (e.g. compound member) datatype reads as a flat
+        // sequence of its base elements, applying base-type precision rules.
+        let arr = Datatype::Array {
+            base_type: Box::new(reduced_int(true, 16)),
+            dimensions: vec![2],
+        };
+        // [-1, 100, 1000, -32768] stored zero-filled at 16-bit precision.
+        let raw: Vec<u8> = vec![
+            0xff, 0xff, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0xe8, 0x03, 0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00,
+        ];
+        assert_eq!(read_as_i32(&raw, &arr).unwrap(), vec![-1, 100, 1000, -32768]);
+        // Nested array-of-array unwraps recursively.
+        let nested = Datatype::Array {
+            base_type: Box::new(arr),
+            dimensions: vec![2],
+        };
+        assert_eq!(read_as_i32(&raw, &nested).unwrap(), vec![-1, 100, 1000, -32768]);
     }
 
     fn make_f64_le_type() -> Datatype {
