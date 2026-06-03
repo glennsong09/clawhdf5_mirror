@@ -258,13 +258,32 @@ impl Selection {
     }
 
     /// Enumerate the selected element indices of a **1-D** dataspace of the
-    /// given `extent`, in selection order.
+    /// given `extent`, in row-major selection order.
     ///
-    /// Returns an error for selections of rank != 1 (N-dimensional VDS
-    /// assembly is not supported in this build).
+    /// Convenience wrapper over [`Selection::iter_linear`] for rank-1 spaces.
     pub fn iter_linear_1d(&self, extent: u64) -> Result<Vec<u64>, FormatError> {
+        self.iter_linear(&[extent])
+    }
+
+    /// Enumerate the **row-major linear indices** of the selected elements of a
+    /// dataspace with shape `dims`, in row-major (C) iteration order.
+    ///
+    /// This is the order HDF5 uses to pair a virtual selection with a source
+    /// selection in a Virtual Dataset, so the i-th index returned here for the
+    /// virtual selection corresponds to the i-th index for the source
+    /// selection. Hyperslab/point selections whose rank differs from
+    /// `dims.len()` are rejected.
+    pub fn iter_linear(&self, dims: &[u64]) -> Result<Vec<u64>, FormatError> {
+        let total: u64 = dims.iter().product();
+        // Row-major strides: row_stride[d] = product(dims[d+1..]).
+        let rank = dims.len();
+        let mut row_stride = vec![1u64; rank];
+        for d in (0..rank.saturating_sub(1)).rev() {
+            row_stride[d] = row_stride[d + 1] * dims[d + 1];
+        }
+
         match self {
-            Selection::All => Ok((0..extent).collect()),
+            Selection::All => Ok((0..total).collect()),
             Selection::None => Ok(Vec::new()),
             Selection::Hyperslab {
                 start,
@@ -272,23 +291,54 @@ impl Selection {
                 count,
                 block,
             } => {
-                if start.len() != 1 {
+                if start.len() != rank {
                     return Err(FormatError::ChunkedReadError(
-                        "only 1-D VDS hyperslab selections are supported".into(),
+                        "VDS selection rank does not match dataspace rank".into(),
                     ));
                 }
-                let (s, st, c, b) = (start[0], stride[0], count[0], block[0]);
-                let mut out = Vec::new();
-                for ci in 0..c {
-                    let base = s + ci * st;
-                    for bi in 0..b {
-                        let idx = base + bi;
-                        if idx >= extent {
-                            return Err(FormatError::ChunkedReadError(
-                                "VDS hyperslab selection exceeds dataspace extent".into(),
-                            ));
+                // Selected coordinates along each dimension, in order.
+                let mut per_dim: Vec<Vec<u64>> = Vec::with_capacity(rank);
+                for d in 0..rank {
+                    let mut coords = Vec::new();
+                    for ci in 0..count[d] {
+                        let base = start[d] + ci * stride[d];
+                        for bi in 0..block[d] {
+                            let coord = base + bi;
+                            if coord >= dims[d] {
+                                return Err(FormatError::ChunkedReadError(
+                                    "VDS hyperslab selection exceeds dataspace extent".into(),
+                                ));
+                            }
+                            coords.push(coord);
                         }
-                        out.push(idx);
+                    }
+                    per_dim.push(coords);
+                }
+                if per_dim.iter().any(|c| c.is_empty()) {
+                    return Ok(Vec::new());
+                }
+                // Cartesian product in row-major order (dim 0 slowest-varying).
+                let out_len: usize = per_dim.iter().map(|c| c.len()).product();
+                let mut out = Vec::with_capacity(out_len);
+                let mut idx = vec![0usize; rank];
+                loop {
+                    let mut lin = 0u64;
+                    for d in 0..rank {
+                        lin += per_dim[d][idx[d]] * row_stride[d];
+                    }
+                    out.push(lin);
+                    // Increment the mixed-radix counter, last dimension fastest.
+                    let mut carry = true;
+                    for d in (0..rank).rev() {
+                        idx[d] += 1;
+                        if idx[d] < per_dim[d].len() {
+                            carry = false;
+                            break;
+                        }
+                        idx[d] = 0;
+                    }
+                    if carry {
+                        break;
                     }
                 }
                 Ok(out)
@@ -296,17 +346,21 @@ impl Selection {
             Selection::Points(pts) => {
                 let mut out = Vec::with_capacity(pts.len());
                 for p in pts {
-                    if p.len() != 1 {
+                    if p.len() != rank {
                         return Err(FormatError::ChunkedReadError(
-                            "only 1-D VDS point selections are supported".into(),
+                            "VDS point selection rank does not match dataspace rank".into(),
                         ));
                     }
-                    if p[0] >= extent {
-                        return Err(FormatError::ChunkedReadError(
-                            "VDS point selection exceeds dataspace extent".into(),
-                        ));
+                    let mut lin = 0u64;
+                    for d in 0..rank {
+                        if p[d] >= dims[d] {
+                            return Err(FormatError::ChunkedReadError(
+                                "VDS point selection exceeds dataspace extent".into(),
+                            ));
+                        }
+                        lin += p[d] * row_stride[d];
                     }
-                    out.push(p[0]);
+                    out.push(lin);
                 }
                 Ok(out)
             }
@@ -552,5 +606,58 @@ mod tests {
     fn decode_irregular_hyperslab_rejected() {
         let bytes = [0x02u8, 0, 0, 0, 0x03, 0, 0, 0, 0x00, 0x02, 0x01, 0, 0, 0];
         assert!(Selection::decode_serialized(&bytes).is_err());
+    }
+
+    #[test]
+    fn iter_linear_2d_block_row_major() {
+        // A 2x2 block at the top-left of a 4x4 space => linear 0,1,4,5.
+        let sel = Selection::Hyperslab {
+            start: vec![0, 0],
+            stride: vec![1, 1],
+            count: vec![1, 1],
+            block: vec![2, 2],
+        };
+        assert_eq!(sel.iter_linear(&[4, 4]).unwrap(), vec![0, 1, 4, 5]);
+
+        // The same block shifted to the bottom-right => 10,11,14,15.
+        let sel2 = Selection::Hyperslab {
+            start: vec![2, 2],
+            stride: vec![1, 1],
+            count: vec![1, 1],
+            block: vec![2, 2],
+        };
+        assert_eq!(sel2.iter_linear(&[4, 4]).unwrap(), vec![10, 11, 14, 15]);
+    }
+
+    #[test]
+    fn iter_linear_2d_strided() {
+        // start=(0,0) stride=(2,2) count=(2,2) block=(1,1) over 4x4 =>
+        // coords (0,0)(0,2)(2,0)(2,2) => linear 0,2,8,10.
+        let sel = Selection::Hyperslab {
+            start: vec![0, 0],
+            stride: vec![2, 2],
+            count: vec![2, 2],
+            block: vec![1, 1],
+        };
+        assert_eq!(sel.iter_linear(&[4, 4]).unwrap(), vec![0, 2, 8, 10]);
+    }
+
+    #[test]
+    fn iter_linear_all_2d() {
+        assert_eq!(
+            Selection::All.iter_linear(&[2, 3]).unwrap(),
+            (0..6).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn iter_linear_rank_mismatch_rejected() {
+        let sel = Selection::Hyperslab {
+            start: vec![0],
+            stride: vec![1],
+            count: vec![1],
+            block: vec![2],
+        };
+        assert!(sel.iter_linear(&[4, 4]).is_err());
     }
 }

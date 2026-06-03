@@ -679,6 +679,23 @@ fn v4_virtual_dataset_same_file_read() {
 }
 
 #[test]
+fn v4_virtual_dataset_2d_same_file_read() {
+    // A 4x4 virtual dataset assembled from two 2x2 same-file sources placed as
+    // non-contiguous blocks (exercises N-dimensional row-major scatter):
+    //   virt[0:2,0:2] <- src_a = [[1,2],[3,4]]
+    //   virt[2:4,2:4] <- src_b = [[5,6],[7,8]]
+    //   everything else -> fill 0
+    let file_data = include_bytes!("fixtures/vds_2d_same_file.h5");
+    let (raw, datatype, _) = read_chunked_dataset(file_data, "virt");
+    let values = read_as_i32(&raw, &datatype).unwrap();
+    assert_eq!(
+        values,
+        vec![1, 2, 0, 0, 3, 4, 0, 0, 0, 0, 5, 6, 0, 0, 7, 8],
+        "2-D VDS block scatter mismatch"
+    );
+}
+
+#[test]
 fn v4_paged_fixed_array_read() {
     // 1025 chunks of 16 int32s, gzip-filtered => Fixed Array index whose data
     // block is *paged* (page holds 1024 elements). Page 0 is full, page 1 holds

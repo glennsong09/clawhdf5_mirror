@@ -385,13 +385,14 @@ pub fn read_raw_data_selection(
 
 /// Assemble a **Virtual Dataset (VDS)** from its source mappings.
 ///
-/// Supports **1-D, same-file** virtual datasets: each mapping's source dataset
-/// is read from the same file and its selected elements are scattered into the
-/// virtual buffer at the positions given by the virtual selection. Unmapped
-/// regions are left at the zero fill value.
+/// Supports **same-file** virtual datasets of any rank: each mapping's source
+/// dataset is read from the same file and its selected elements are scattered
+/// into the virtual buffer at the positions given by the virtual selection
+/// (both enumerated in row-major order, as HDF5 pairs them). Unmapped regions
+/// are left at the zero fill value.
 ///
-/// External-file sources and N-dimensional selections are reported as
-/// unsupported rather than silently producing wrong data.
+/// External-file sources are reported as unsupported rather than silently
+/// producing wrong data.
 fn read_virtual_data(
     file_data: &[u8],
     global_heap_address: Option<u64>,
@@ -409,16 +410,7 @@ fn read_virtual_data(
     let total_elems = dataspace.num_elements() as usize;
     let mut out = vec![0u8; total_elems.saturating_mul(elem_size)];
 
-    if dataspace.dimensions.len() > 1 {
-        return Err(FormatError::ChunkedReadError(
-            "N-dimensional virtual datasets are not supported".into(),
-        ));
-    }
-    let virtual_extent = dataspace
-        .dimensions
-        .first()
-        .copied()
-        .unwrap_or(total_elems as u64);
+    let virtual_dims = &dataspace.dimensions;
 
     let addr = global_heap_address.ok_or_else(|| {
         FormatError::ChunkedReadError("virtual dataset has no mapping global heap".into())
@@ -443,11 +435,11 @@ fn read_virtual_data(
         let (vsel, _) = Selection::decode_serialized(&m.virtual_selection)?;
         let (ssel, _) = Selection::decode_serialized(&m.source_selection)?;
 
-        let (src_raw, src_elems) =
+        let (src_raw, src_dims) =
             read_named_dataset_raw(file_data, &m.source_dataset, offset_size, length_size)?;
 
-        let vidx = vsel.iter_linear_1d(virtual_extent)?;
-        let sidx = ssel.iter_linear_1d(src_elems as u64)?;
+        let vidx = vsel.iter_linear(virtual_dims)?;
+        let sidx = ssel.iter_linear(&src_dims)?;
         if vidx.len() != sidx.len() {
             return Err(FormatError::ChunkedReadError(
                 "virtual/source selection element counts differ".into(),
@@ -468,14 +460,14 @@ fn read_virtual_data(
     Ok(out)
 }
 
-/// Read a named dataset's raw (decoded) bytes and element count, navigating
+/// Read a named dataset's raw (decoded) bytes and its dimensions, navigating
 /// from the superblock. Used to pull VDS source datasets out of the same file.
 fn read_named_dataset_raw(
     file_data: &[u8],
     path: &str,
     _offset_size: u8,
     _length_size: u8,
-) -> Result<(Vec<u8>, usize), FormatError> {
+) -> Result<(Vec<u8>, Vec<u64>), FormatError> {
     use crate::filter_pipeline::FilterPipeline;
     use crate::group_v2::resolve_path_any;
     use crate::message_type::MessageType;
@@ -511,7 +503,7 @@ fn read_named_dataset_raw(
         sb.offset_size,
         sb.length_size,
     )?;
-    Ok((raw, dataspace.num_elements() as usize))
+    Ok((raw, dataspace.dimensions.clone()))
 }
 
 /// Extract selected elements from a full dataset buffer.
