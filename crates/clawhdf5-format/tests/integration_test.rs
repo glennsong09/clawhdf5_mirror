@@ -663,6 +663,23 @@ fn v4_fixed_array_read() {
 }
 
 #[test]
+fn v4_paged_fixed_array_read() {
+    // 1025 chunks of 16 int32s, gzip-filtered => Fixed Array index whose data
+    // block is *paged* (page holds 1024 elements). Page 0 is full, page 1 holds
+    // the single trailing chunk. Chunk k stores value k at its first element.
+    let file_data = include_bytes!("fixtures/v4_fixed_array_paged.h5");
+    let (raw, datatype, _) = read_chunked_dataset(file_data, "big");
+    let values = read_as_i32(&raw, &datatype).unwrap();
+    assert_eq!(values.len(), 1025 * 16);
+    for k in 0..1025usize {
+        assert_eq!(values[k * 16], k as i32, "chunk-start mismatch at chunk {k}");
+        for j in 1..16 {
+            assert_eq!(values[k * 16 + j], 0, "non-start element nonzero at {}", k * 16 + j);
+        }
+    }
+}
+
+#[test]
 fn v4_2d_fixed_array_read() {
     let file_data = include_bytes!("fixtures/v4_2d.h5");
     let (raw, datatype, _) = read_chunked_dataset(file_data, "matrix");

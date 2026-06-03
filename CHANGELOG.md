@@ -15,6 +15,13 @@
   float members all read end-to-end, validated against HDF5 2.0.
 
 ### Bug Fixes
+- `clawhdf5-format`: read **paged Fixed Array** chunk indexes. A filtered,
+  fixed-dimension dataset with more than one data-block page (>1024 chunks by
+  default) previously failed with "paged Fixed Array data blocks not yet
+  supported". The reader now walks the page-init bitmap (MSB-first), skips
+  uninitialized pages, and resolves each page's fixed full-size slot (including
+  the short final page). Reverse-engineered and validated end-to-end against an
+  HDF5 2.0 file.
 - `clawhdf5-format`: read **array-typed datatypes** (e.g. an array-typed
   compound member) via `read_as_i32/i64/u64/f32/f64` — previously a
   `TypeMismatch`. The array is read as a flat sequence of its base elements

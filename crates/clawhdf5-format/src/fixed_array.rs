@@ -140,27 +140,18 @@ pub fn read_fixed_array_chunks(
         ));
     }
 
-    // Skip version(1) + client_id(1) + header_address(offset_size)
-    let mut pos = db_header_size;
+    // Elements start immediately after the data block prefix.
+    let elements_start = db_offset + db_header_size;
 
-    // Check if paged
-    let page_size = 1u64 << header.max_nelmts_bits;
-    let is_paged = header.num_elements > page_size;
-
-    if is_paged {
-        // For paged data blocks, we need to handle page bitmap + pages
-        // For now, implement non-paged path (covers most real-world cases)
-        return Err(FormatError::ChunkedReadError(
-            "paged Fixed Array data blocks not yet supported".into(),
-        ));
-    }
-
-    // Non-paged: elements stored directly
     let num_elements = header.num_elements as usize;
     let os = offset_size as usize;
+    // On-disk stride of one element. For non-filtered arrays the element is just
+    // the chunk address (== offset_size); for filtered arrays it is
+    // address + chunk_size + filter_mask (== header.element_size).
+    let elem_stride = (header.element_size as usize).max(os);
 
-    // Compute chunk offsets based on index
-    // Chunks are stored in row-major order within the dataset space
+    // Compute chunk offsets based on index.
+    // Chunks are stored in row-major order within the dataset space.
     let mut num_chunks_per_dim = Vec::with_capacity(rank);
     for d_idx in 0..rank {
         let ch_dim = chunk_dimensions[d_idx] as u64;
@@ -177,97 +168,134 @@ pub fn read_fixed_array_chunks(
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
     let mut chunks = Vec::new();
-
-    for i in 0..num_elements {
-        let abs_pos = db_offset
-            .checked_add(pos)
-            .ok_or(FormatError::UnexpectedEof {
-                expected: usize::MAX,
-                available: file_data.len(),
-            })?;
-        if abs_pos > file_data.len() {
-            return Err(FormatError::UnexpectedEof {
-                expected: abs_pos,
-                available: file_data.len(),
-            });
-        }
-        let elem_data = &file_data[abs_pos..];
-        if header.client_id == 0 {
-            // Non-filtered: just address
-            if db_offset
-                .checked_add(pos)
-                .and_then(|p| p.checked_add(os))
-                .is_none_or(|end| end > file_data.len())
-            {
-                return Err(FormatError::UnexpectedEof {
-                    expected: db_offset.saturating_add(pos).saturating_add(os),
-                    available: file_data.len(),
-                });
-            }
-            let address = read_offset(elem_data, 0, offset_size)?;
-            pos += os;
-
-            if is_undefined(file_data, db_offset + pos - os, offset_size) {
-                continue; // unallocated chunk
-            }
-
+    let push_element = |i: usize, abs: usize, chunks: &mut Vec<ChunkInfo>| -> Result<(), FormatError> {
+        if let Some((address, chunk_size, filter_mask)) = parse_fa_element(
+            file_data,
+            abs,
+            header.client_id,
+            offset_size,
+            header.element_size,
+            chunk_byte_size,
+        )? {
             let offsets = index_to_chunk_offsets(i, &num_chunks_per_dim, chunk_dimensions);
             chunks.push(ChunkInfo {
-                chunk_size: chunk_byte_size as u32,
-                filter_mask: 0,
-                offsets,
-                address,
-            });
-        } else {
-            // Filtered: address(offset_size) + chunk_size(variable) + filter_mask(4)
-            let es = header.element_size as usize;
-            if es < os + 4 {
-                return Err(FormatError::ChunkedReadError(
-                    "element_size too small for filtered element".into(),
-                ));
-            }
-            let chunk_size_bytes = es - os - 4;
-            let elem_total = os + chunk_size_bytes + 4;
-            if db_offset
-                .checked_add(pos)
-                .and_then(|p| p.checked_add(elem_total))
-                .is_none_or(|end| end > file_data.len())
-            {
-                return Err(FormatError::UnexpectedEof {
-                    expected: db_offset.saturating_add(pos).saturating_add(elem_total),
-                    available: file_data.len(),
-                });
-            }
-
-            let address = read_offset(elem_data, 0, offset_size)?;
-
-            // Read chunk_size (variable length, little-endian)
-            let chunk_size = read_variable_length(&elem_data[os..], chunk_size_bytes)?;
-
-            let fm_off = os + chunk_size_bytes;
-            let filter_mask = u32::from_le_bytes([
-                elem_data[fm_off],
-                elem_data[fm_off + 1],
-                elem_data[fm_off + 2],
-                elem_data[fm_off + 3],
-            ]);
-            pos += elem_total;
-
-            if is_undefined(file_data, db_offset + pos - elem_total, offset_size) {
-                continue; // unallocated chunk
-            }
-
-            let offsets = index_to_chunk_offsets(i, &num_chunks_per_dim, chunk_dimensions);
-            chunks.push(ChunkInfo {
-                chunk_size: chunk_size as u32,
+                chunk_size,
                 filter_mask,
                 offsets,
                 address,
             });
         }
+        Ok(())
+    };
+
+    // A data block is paged when it holds more elements than fit in one page.
+    let page_nelmts = 1usize << header.max_nelmts_bits;
+    let is_paged = num_elements > page_nelmts;
+
+    if !is_paged {
+        // Non-paged: prefix, then `num_elements` elements packed directly,
+        // then a trailing checksum (which we don't validate).
+        for i in 0..num_elements {
+            push_element(i, elements_start + i * elem_stride, &mut chunks)?;
+        }
+        return Ok(chunks);
+    }
+
+    // Paged layout: prefix, then a page-init bitmap (one bit per page, MSB-first
+    // within each byte), then a 4-byte checksum, then the pages. Every page
+    // occupies a full slot of `page_nelmts` elements plus a 4-byte checksum;
+    // only the final page holds fewer elements. Uninitialized pages (bit clear)
+    // still occupy their slot on disk but are zero-filled, so the bitmap — not a
+    // 0xFF sentinel — is what marks a whole page as unallocated.
+    let npages = num_elements.div_ceil(page_nelmts);
+    let bitmap_size = npages.div_ceil(8);
+    let bitmap_start = elements_start;
+    // prefix(db_header_size) + bitmap + checksum(4)
+    let pages_start = db_offset + db_header_size + bitmap_size + 4;
+    let page_stride = page_nelmts * elem_stride + 4;
+
+    if bitmap_start + bitmap_size > file_data.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: bitmap_start + bitmap_size,
+            available: file_data.len(),
+        });
+    }
+
+    for p in 0..npages {
+        let page_first = p * page_nelmts;
+        let page_count = core::cmp::min(page_nelmts, num_elements - page_first);
+
+        // Check the page-init bit (MSB-first within each byte).
+        let bit_byte = file_data[bitmap_start + p / 8];
+        let bit_mask = 1u8 << (7 - (p % 8));
+        if bit_byte & bit_mask == 0 {
+            continue; // entire page unallocated
+        }
+
+        let page_off = pages_start + p * page_stride;
+        for e in 0..page_count {
+            push_element(page_first + e, page_off + e * elem_stride, &mut chunks)?;
+        }
     }
 
     Ok(chunks)
+}
+
+/// Parse a single Fixed Array element at absolute file offset `abs`.
+///
+/// Returns `Some((address, chunk_size, filter_mask))` for an allocated chunk, or
+/// `None` if the element is undefined (an unallocated chunk, address all-`0xFF`).
+fn parse_fa_element(
+    file_data: &[u8],
+    abs: usize,
+    client_id: u8,
+    offset_size: u8,
+    element_size: u8,
+    chunk_byte_size: u64,
+) -> Result<Option<(u64, u32, u32)>, FormatError> {
+    let os = offset_size as usize;
+    if client_id == 0 {
+        // Non-filtered: element is just the chunk address.
+        if abs + os > file_data.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: abs + os,
+                available: file_data.len(),
+            });
+        }
+        if is_undefined(file_data, abs, offset_size) {
+            return Ok(None);
+        }
+        let address = read_offset(file_data, abs, offset_size)?;
+        Ok(Some((address, chunk_byte_size as u32, 0)))
+    } else {
+        // Filtered: address(offset_size) + chunk_size(variable) + filter_mask(4)
+        let es = element_size as usize;
+        if es < os + 4 {
+            return Err(FormatError::ChunkedReadError(
+                "element_size too small for filtered element".into(),
+            ));
+        }
+        let chunk_size_bytes = es - os - 4;
+        if abs + es > file_data.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: abs + es,
+                available: file_data.len(),
+            });
+        }
+        if is_undefined(file_data, abs, offset_size) {
+            return Ok(None);
+        }
+        let address = read_offset(file_data, abs, offset_size)?;
+        let chunk_size = read_variable_length(&file_data[abs + os..], chunk_size_bytes)?;
+        let fm_off = abs + os + chunk_size_bytes;
+        let filter_mask = u32::from_le_bytes([
+            file_data[fm_off],
+            file_data[fm_off + 1],
+            file_data[fm_off + 2],
+            file_data[fm_off + 3],
+        ]);
+        Ok(Some((address, chunk_size as u32, filter_mask)))
+    }
 }
 
 /// Convert a linear chunk index to N-dimensional chunk offsets in dataset space.
@@ -534,5 +562,104 @@ mod tests {
         assert_eq!(chunks[1].chunk_size, 115);
         assert_eq!(chunks[2].address, 0x3000);
         assert_eq!(chunks[2].chunk_size, 100);
+    }
+
+    /// Build a synthetic *paged* Fixed Array (non-filtered) and verify reading.
+    ///
+    /// Layout reverse-engineered and confirmed against an HDF5 2.0 file:
+    /// after the FADB prefix comes a page-init bitmap (MSB-first within each
+    /// byte), a 4-byte checksum, then full-size page slots (`page_nelmts`
+    /// elements + a 4-byte checksum each), with only the last page shorter.
+    /// Uninitialized pages occupy their slot but are skipped via the bitmap.
+    #[test]
+    fn read_paged_non_filtered_chunks() {
+        let offset_size: u8 = 8;
+        let length_size: u8 = 8;
+        let os = offset_size as usize;
+
+        // page_nelmts = 1 << 2 = 4. Use 11 elements => 3 pages
+        // (page0: 4, page1: 4, page2: 3 short). Initialize pages 0 and 2; leave
+        // page 1 uninitialized. 3 pages still fits one bitmap byte, but we place
+        // the set bits at positions 7 and 5 to lock the MSB-first ordering.
+        let max_nelmts_bits = 2u8;
+        let page_nelmts = 1usize << max_nelmts_bits; // 4
+        let num_elements = 11u64;
+        let db_header_size = 4 + 1 + 1 + os; // FADB sig+ver+client+header_addr
+        let bitmap_size = 1usize; // ceil(3/8)
+        let page_total = page_nelmts * os + 4; // elements + checksum
+
+        let fahd_offset = 0x100usize;
+        let db_offset = 0x400usize;
+        let mut file_data = vec![0u8; 0x4000];
+
+        // FAHD
+        file_data[fahd_offset..fahd_offset + 4].copy_from_slice(b"FAHD");
+        file_data[fahd_offset + 4] = 0; // version
+        file_data[fahd_offset + 5] = 0; // client_id = non-filtered
+        file_data[fahd_offset + 6] = os as u8; // element_size = address only
+        file_data[fahd_offset + 7] = max_nelmts_bits;
+        file_data[fahd_offset + 8..fahd_offset + 16].copy_from_slice(&num_elements.to_le_bytes());
+        file_data[fahd_offset + 16..fahd_offset + 24]
+            .copy_from_slice(&(db_offset as u64).to_le_bytes());
+
+        // FADB prefix
+        file_data[db_offset..db_offset + 4].copy_from_slice(b"FADB");
+        file_data[db_offset + 4] = 0; // version
+        file_data[db_offset + 5] = 0; // client_id
+        file_data[db_offset + 6..db_offset + 6 + os]
+            .copy_from_slice(&(fahd_offset as u64).to_le_bytes());
+
+        // Page-init bitmap: pages 0 and 2 initialized, page 1 not.
+        // MSB-first => page0 -> bit7 (0x80), page2 -> bit5 (0x20) => 0xA0.
+        let bitmap_off = db_offset + db_header_size;
+        file_data[bitmap_off] = 0b1010_0000;
+
+        // Pages start after bitmap + 4-byte checksum.
+        let pages_start = db_offset + db_header_size + bitmap_size + 4;
+
+        let base_addr = 0x1000u64;
+        // Page 0 (elements 0..4) and page 2 (elements 8..11) carry addresses;
+        // page 1's slot is left zero-filled and must be skipped.
+        for &p in &[0usize, 2usize] {
+            let page_off = pages_start + p * page_total;
+            let count = core::cmp::min(page_nelmts, num_elements as usize - p * page_nelmts);
+            for e in 0..count {
+                let i = p * page_nelmts + e;
+                let addr = base_addr + i as u64 * 0x100;
+                let pos = page_off + e * os;
+                file_data[pos..pos + os].copy_from_slice(&addr.to_le_bytes());
+            }
+        }
+
+        let header =
+            FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
+        assert_eq!(header.num_elements, 11);
+
+        let ds_dims = vec![11u64 * 20];
+        let chunk_dims = vec![20u32];
+        let chunks = read_fixed_array_chunks(
+            &file_data,
+            &header,
+            &ds_dims,
+            &chunk_dims,
+            8,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+
+        // Page 1 (elements 4,5,6,7) is uninitialized => skipped. The remaining
+        // 7 chunks (0..4 and 8..11) come back with their original linear index.
+        assert_eq!(chunks.len(), 7);
+        let mut got: Vec<(u64, u64)> = chunks
+            .iter()
+            .map(|c| (c.offsets[0], c.address))
+            .collect();
+        got.sort();
+        let expect: Vec<(u64, u64)> = [0usize, 1, 2, 3, 8, 9, 10]
+            .iter()
+            .map(|&i| (i as u64 * 20, base_addr + i as u64 * 0x100))
+            .collect();
+        assert_eq!(got, expect);
     }
 }
