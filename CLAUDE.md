@@ -29,7 +29,11 @@ Cargo workspace with 17 crates under `crates/`:
 
 ## Key Features
 - Zero-dependency HDF5 read/write (no libhdf5 C library required)
-- HNSW vector index for semantic similarity search over agent memories
+- HNSW vector index for semantic similarity search over agent memories — the
+  `clawhdf5-agent` `hnsw` feature is **on by default**, so `hybrid_search` uses
+  the approximate `clawhdf5-ann` index for the vector stage (the index mirrors
+  the cache and self-heals on drift). Build the agent with
+  `--no-default-features --features float16` to force the exact linear cosine scan.
 - WAL (write-ahead log) for crash-safe persistence
 - GPU-accelerated batch I/O for large dataset processing
 - Python and Node.js bindings for cross-language use
