@@ -3,11 +3,17 @@
 ## Unreleased
 
 ### New Features
-- `clawhdf5-format`: decode the **scale-offset filter** (id 6), integer variant
-  (`H5Z_SO_INT`) — previously unsupported. Handles signed/unsigned element
-  sizes, negative minima and fill values; the on-disk format was reverse-
-  engineered against HDF5 2.0 and validated end-to-end. Floating-point
-  scale-offset (D-scale/E-scale) remains unsupported.
+- `clawhdf5-format`: decode the **scale-offset filter** (id 6) — both the
+  integer variant (`H5Z_SO_INT`) and the floating-point **D-scale** variant
+  (`H5Z_SO_FLOAT_DSCALE`). Handles signed/unsigned int sizes, f32/f64, negative
+  minima, decimal scale factors and fill values; reverse-engineered against
+  HDF5 2.0 and validated end-to-end. The float E-scale variant remains
+  unsupported.
+- `clawhdf5-format`: decode the **N-Bit filter** (id 5), atomic variant —
+  previously unsupported. Unsigned reduced-precision datasets read end-to-end;
+  signed values are restored to canonical bytes (datatype-level sign extension
+  of reduced-precision integers is a separate, pre-existing concern). Recursive
+  compound/array N-Bit layouts remain unsupported.
 
 ### Bug Fixes
 - `clawhdf5-format`: read datasets written by modern HDF5 (1.14+/2.0, i.e.
