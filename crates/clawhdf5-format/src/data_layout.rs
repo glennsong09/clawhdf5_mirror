@@ -250,7 +250,9 @@ impl DataLayout {
 
         match version {
             3 => Self::parse_v3(data, layout_class, offset_size, length_size),
-            4 => Self::parse_v4(data, layout_class, offset_size, length_size),
+            // v5 (emitted by HDF5 1.14+/2.0 with `libver=latest`) uses the same
+            // message structure as v4 — only the version number was bumped.
+            4 | 5 => Self::parse_v4(data, layout_class, offset_size, length_size),
             _ => Err(FormatError::InvalidLayoutVersion(version)),
         }
     }
@@ -627,6 +629,30 @@ mod tests {
     }
 
     #[test]
+    fn v5_chunked_from_hdf5_2_0() {
+        // Real data layout message from h5py 3.16 / HDF5 2.0 (`libver=latest`)
+        // for a gzip-compressed 1-D chunked dataset. Version 5 uses the same
+        // structure as v4 (here: chunked, Fixed Array index). Regression guard
+        // for reading modern-format chunked datasets.
+        let bytes: [u8; 17] = [
+            0x05, 0x02, 0x00, 0x02, 0x01, 0x0a, 0x08, 0x03, 0x0a, 0xef, 0x05, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00,
+        ];
+        let layout = DataLayout::parse(&bytes, 8, 8).unwrap();
+        match layout {
+            DataLayout::Chunked {
+                chunk_dimensions,
+                chunk_index_type,
+                ..
+            } => {
+                assert_eq!(chunk_dimensions, vec![10, 8]);
+                assert_eq!(chunk_index_type, Some(3)); // Fixed Array
+            }
+            other => panic!("expected Chunked, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn v4_chunked_single_chunk_no_filters() {
         let mut buf = vec![4u8, 2]; // version=4, class=2
         buf.push(0); // flags (no filters)
@@ -678,9 +704,10 @@ mod tests {
 
     #[test]
     fn invalid_version() {
-        let buf = vec![5u8, 0, 0, 0];
+        // v3-v5 are supported; v6 is not a real layout message version.
+        let buf = vec![6u8, 0, 0, 0];
         let err = DataLayout::parse(&buf, 8, 8).unwrap_err();
-        assert_eq!(err, FormatError::InvalidLayoutVersion(5));
+        assert_eq!(err, FormatError::InvalidLayoutVersion(6));
     }
 
     #[test]

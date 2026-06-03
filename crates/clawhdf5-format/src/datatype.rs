@@ -503,7 +503,9 @@ impl Datatype {
                         },
                         pos,
                     ))
-                } else if version == 3 {
+                } else if (3..=5).contains(&version) {
+                    // v3, v4 and v5 share the array encoding (ndims, dims, base
+                    // type); HDF5 1.14+/2.0 with `libver=latest` emits v5.
                     ensure_len(data, pos, 1)?;
                     let ndims = data[pos] as usize;
                     pos += 1;
@@ -1054,6 +1056,29 @@ mod tests {
                 ));
             }
             _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn test_array_v5_from_hdf5_2_0() {
+        // Real datatype message from h5py 3.16 / HDF5 2.0 (`libver=latest`) for
+        // an array dtype `('f8', (3,))`: datatype version 5, class 10, reusing
+        // the v3 array encoding (ndims, dims, base type).
+        let bytes: [u8; 33] = [
+            0x5a, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x11,
+            0x20, 0x3f, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x34, 0x0b, 0x00,
+            0x34, 0xff, 0x03, 0x00, 0x00,
+        ];
+        let (dt, _) = Datatype::parse(&bytes).unwrap();
+        match dt {
+            Datatype::Array {
+                base_type,
+                dimensions,
+            } => {
+                assert_eq!(dimensions, vec![3]);
+                assert!(matches!(*base_type, Datatype::FloatingPoint { size: 8, .. }));
+            }
+            other => panic!("expected Array, got {other:?}"),
         }
     }
 
