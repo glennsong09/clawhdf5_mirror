@@ -853,3 +853,21 @@ fn dense_group_links_roundtrip() {
     assert_eq!(file.dataset("small/a").unwrap().read_f64().unwrap(), vec![1.0]);
     assert_eq!(file.dataset("small/b").unwrap().read_f64().unwrap(), vec![2.0]);
 }
+
+#[test]
+fn reads_libhdf5_multiblock_fractal_heap() {
+    // A group whose dense attributes overflow a single fractal-heap direct
+    // block, so libhdf5 stored them under a root indirect block (FHIB) with
+    // multiple direct blocks. Reading requires deriving the direct/indirect row
+    // split from the heap geometry, not the FRHP "starting rows" field.
+    let bytes = include_bytes!("../../clawhdf5-format/tests/fixtures/fractal_heap_multiblock.h5");
+    let file = File::from_bytes(bytes.to_vec()).unwrap();
+    let attrs = file.group("g").unwrap().attrs().unwrap();
+    for i in 0..80i64 {
+        let name = format!("a{i:03}");
+        match attrs.get(&name) {
+            Some(AttrValue::I64(v)) => assert_eq!(*v, i * 3, "{name}"),
+            other => panic!("{name} = {other:?}"),
+        }
+    }
+}

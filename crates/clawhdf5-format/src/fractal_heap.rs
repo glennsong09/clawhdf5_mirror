@@ -379,8 +379,9 @@ impl FractalHeapHeader {
         // Build table of (block_size, heap_offset) for each child entry
         let mut current_heap_offset = iblock_heap_offset;
 
-        // Count direct block entries vs indirect block entries
-        let start_indirect = self.starting_row_of_indirect_blocks as usize;
+        // Rows below max_direct_rows hold direct blocks; rows at/above hold
+        // child indirect blocks. (NOT the FRHP "starting rows" field.)
+        let start_indirect = self.max_direct_rows();
 
         // Read child addresses for direct block rows
         let max_direct_rows = nrows_usize.min(start_indirect);
@@ -453,6 +454,25 @@ impl FractalHeapHeader {
             expected: target_offset as usize + length,
             available: file_data.len(),
         })
+    }
+
+    /// Number of rows in the doubling table whose block size is at most the
+    /// maximum *direct* block size. Rows below this hold direct blocks; rows at
+    /// or above it hold child indirect blocks.
+    ///
+    /// This is derived from the heap geometry, NOT the FRHP
+    /// "Starting # of Rows in Root Indirect Block" field (a constant, often 1)
+    /// — confusing the two makes a multi-direct-block heap unreadable.
+    fn max_direct_rows(&self) -> usize {
+        if self.starting_block_size == 0 {
+            return usize::MAX;
+        }
+        // Rows 0 and 1 share the starting block size; row r (r >= 1) is
+        // starting_block_size * 2^(r-1). The largest direct row reaches
+        // max_direct_block_size, giving log2(max/start) + 2 direct rows.
+        let ratio = (self.max_direct_block_size / self.starting_block_size).max(1);
+        let log2 = 63 - ratio.leading_zeros() as usize;
+        log2 + 2
     }
 
     /// Get block size for a given row in the doubling table.
