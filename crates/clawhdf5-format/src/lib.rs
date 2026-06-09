@@ -79,6 +79,8 @@ pub mod lane_partition;
 pub mod link_info;
 pub mod link_message;
 pub mod local_heap;
+#[cfg(feature = "merkle")]
+pub mod merkle;
 pub mod message_type;
 pub mod metadata_cache;
 pub mod metadata_index;

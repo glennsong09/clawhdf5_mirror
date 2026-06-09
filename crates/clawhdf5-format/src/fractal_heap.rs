@@ -383,69 +383,67 @@ impl FractalHeapHeader {
         // child indirect blocks. (NOT the FRHP "starting rows" field.)
         let start_indirect = self.max_direct_rows();
 
-        // Read child addresses for direct block rows
-        let max_direct_rows = nrows_usize.min(start_indirect);
-
-        for row in 0..max_direct_rows {
+        for row in 0..nrows_usize {
             let block_size = self.block_size_for_row(row);
+            let is_direct_row = block_size <= self.max_direct_block_size;
 
-            for _col in 0..tw {
-                let child_addr = read_offset(file_data, pos, offset_size)?;
-                pos += offset_size as usize;
+            if is_direct_row {
+                // Direct block row
+                for _col in 0..tw {
+                    let child_addr = read_offset(file_data, pos, offset_size)?;
+                    pos += offset_size as usize;
 
-                if self.io_filter_encoded_length > 0 {
-                    // filtered_size(length_size) + filter_mask(4)
-                    // Skip for now - we don't handle filtered direct blocks in fractal heaps
-                    pos += 4; // filter_mask - simplified
-                }
-
-                if !is_undefined(child_addr, offset_size) {
-                    let block_end = current_heap_offset + block_size;
-                    if target_offset >= current_heap_offset && target_offset < block_end {
-                        return self.read_from_direct_block(
-                            file_data,
-                            child_addr as usize,
-                            block_size,
-                            current_heap_offset,
-                            target_offset,
-                            length,
-                            offset_size,
-                        );
+                    if self.io_filter_encoded_length > 0 {
+                        // filtered_size(length_size) + filter_mask(4)
+                        // Skip for now - we don't handle filtered direct blocks in fractal heaps
+                        pos += 4; // filter_mask - simplified
                     }
-                }
-                current_heap_offset += block_size;
-            }
-        }
 
-        // If we have indirect block rows
-        for row in start_indirect..nrows_usize {
-            let _block_size = self.block_size_for_row(row);
-            let child_nrows = row - start_indirect + 1;
-
-            for _col in 0..tw {
-                let child_addr = read_offset(file_data, pos, offset_size)?;
-                pos += offset_size as usize;
-
-                if !is_undefined(child_addr, offset_size) {
-                    // Calculate total heap space covered by this indirect block child
-                    let total_child_space = self.indirect_block_heap_size(child_nrows);
-                    let block_end = current_heap_offset + total_child_space;
-                    if target_offset >= current_heap_offset && target_offset < block_end {
-                        return self.read_from_indirect_block(
-                            file_data,
-                            child_addr as usize,
-                            child_nrows as u16,
-                            current_heap_offset,
-                            target_offset,
-                            length,
-                            offset_size,
-                            depth_remaining - 1,
-                        );
+                    if !is_undefined(child_addr, offset_size) {
+                        let block_end = current_heap_offset + block_size;
+                        if target_offset >= current_heap_offset && target_offset < block_end {
+                            return self.read_from_direct_block(
+                                file_data,
+                                child_addr as usize,
+                                block_size,
+                                current_heap_offset,
+                                target_offset,
+                                length,
+                                offset_size,
+                            );
+                        }
                     }
-                    current_heap_offset += total_child_space;
-                } else {
-                    let total_child_space = self.indirect_block_heap_size(child_nrows);
-                    current_heap_offset += total_child_space;
+                    current_heap_offset += block_size;
+                }
+            } else {
+                // Indirect block row
+                let child_nrows = row - start_indirect + 1;
+
+                for _col in 0..tw {
+                    let child_addr = read_offset(file_data, pos, offset_size)?;
+                    pos += offset_size as usize;
+
+                    if !is_undefined(child_addr, offset_size) {
+                        // Calculate total heap space covered by this indirect block child
+                        let total_child_space = self.indirect_block_heap_size(child_nrows);
+                        let block_end = current_heap_offset + total_child_space;
+                        if target_offset >= current_heap_offset && target_offset < block_end {
+                            return self.read_from_indirect_block(
+                                file_data,
+                                child_addr as usize,
+                                child_nrows as u16,
+                                current_heap_offset,
+                                target_offset,
+                                length,
+                                offset_size,
+                                depth_remaining - 1,
+                            );
+                        }
+                        current_heap_offset += total_child_space;
+                    } else {
+                        let total_child_space = self.indirect_block_heap_size(child_nrows);
+                        current_heap_offset += total_child_space;
+                    }
                 }
             }
         }
