@@ -48,7 +48,7 @@ const MAX_DEPTH: usize = 40;
 /// The null sentinel string used for padding sparse-chunk slots.
 const NULL_SENTINEL_DATA: &[u8] = b"null";
 
-/// Errors that can occur during Merkle tree construction.
+/// Errors that can occur during Merkle tree operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MerkleError {
     /// Tree depth exceeds maximum allowed (40 levels, supporting up to 2^40 chunks).
@@ -59,6 +59,22 @@ pub enum MerkleError {
         /// Maximum allowed depth.
         max: usize,
     },
+    /// Invalid attribute data during unpacking.
+    InvalidAttribute {
+        /// Reason for the failure.
+        reason: InvalidAttrReason,
+    },
+}
+
+/// Reasons why a merkle attribute is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidAttrReason {
+    /// Attribute size is not 65 bytes.
+    WrongSize,
+    /// Unknown algorithm identifier.
+    UnknownAlgorithm,
+    /// Integrity hash does not match.
+    IntegrityMismatch,
 }
 
 impl core::fmt::Display for MerkleError {
@@ -70,6 +86,14 @@ impl core::fmt::Display for MerkleError {
                     "Merkle tree depth {} exceeds maximum allowed depth {}",
                     requested, max
                 )
+            }
+            MerkleError::InvalidAttribute { reason } => {
+                let msg = match reason {
+                    InvalidAttrReason::WrongSize => "attribute size is not 65 bytes",
+                    InvalidAttrReason::UnknownAlgorithm => "unknown algorithm identifier",
+                    InvalidAttrReason::IntegrityMismatch => "integrity hash mismatch",
+                };
+                write!(f, "Invalid merkle attribute: {}", msg)
             }
         }
     }
@@ -716,8 +740,34 @@ const ALG_ID_K12: u8 = 0x02;
 /// Domain separator for companion integrity hash.
 const INTEGRITY_PREFIX: u8 = 0x03;
 
+// ---- 65-byte attribute layout offsets ----
+//
+// ┌─────────────────────────────────┬───────┬─────────────────────────────────┐
+// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │
+// └─────────────────────────────────┴───────┴─────────────────────────────────┘
+// 0                                32      33                                65
+//
+/// Offset of root hash in packed attribute.
+const ATTR_ROOT_OFFSET: usize = 0;
+/// Size of root hash field.
+const ATTR_ROOT_SIZE: usize = HASH_SIZE;
+/// End offset of root hash (exclusive).
+const ATTR_ROOT_END: usize = ATTR_ROOT_OFFSET + ATTR_ROOT_SIZE; // 32
+
+/// Offset of algorithm identifier in packed attribute.
+const ATTR_ALG_OFFSET: usize = ATTR_ROOT_END; // 32
+/// Size of algorithm identifier field.
+const ATTR_ALG_SIZE: usize = 1;
+
+/// Offset of integrity hash in packed attribute.
+const ATTR_INTEGRITY_OFFSET: usize = ATTR_ALG_OFFSET + ATTR_ALG_SIZE; // 33
+/// Size of integrity hash field.
+const ATTR_INTEGRITY_SIZE: usize = HASH_SIZE;
+/// End offset of integrity hash (exclusive).
+const ATTR_INTEGRITY_END: usize = ATTR_INTEGRITY_OFFSET + ATTR_INTEGRITY_SIZE; // 65
+
 /// Size of the packed merkle_root attribute (root + alg_id + integrity).
-pub const MERKLE_ATTR_SIZE: usize = HASH_SIZE + 1 + HASH_SIZE; // 65 bytes
+pub const MERKLE_ATTR_SIZE: usize = ATTR_INTEGRITY_END; // 65 bytes
 
 /// Name of the HDF5 attribute storing merkle root information.
 pub const MERKLE_ATTR_NAME: &str = "merkle_root";
@@ -798,43 +848,54 @@ impl MerkleAttr {
     }
 
     /// Pack the attribute into a 65-byte binary blob.
+    ///
+    /// Layout: `[root:32][alg:1][integrity:32]`
     #[must_use]
     pub fn pack(&self) -> [u8; MERKLE_ATTR_SIZE] {
         let mut buf = [0u8; MERKLE_ATTR_SIZE];
-        buf[0..HASH_SIZE].copy_from_slice(&self.root);
-        buf[HASH_SIZE] = self.algorithm.to_id();
-        buf[HASH_SIZE + 1..].copy_from_slice(&self.integrity);
+        buf[ATTR_ROOT_OFFSET..ATTR_ROOT_END].copy_from_slice(&self.root);
+        buf[ATTR_ALG_OFFSET] = self.algorithm.to_id();
+        buf[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END].copy_from_slice(&self.integrity);
         buf
     }
 
     /// Unpack from a 65-byte binary blob.
     ///
-    /// Returns `None` if:
-    /// - The data is not exactly 65 bytes
-    /// - The algorithm ID is unknown
-    /// - The integrity hash does not match
-    #[must_use]
-    pub fn unpack(data: &[u8]) -> Option<Self> {
+    /// Layout: `[root:32][alg:1][integrity:32]`
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if:
+    /// - The data is not exactly 65 bytes (`WrongSize`)
+    /// - The algorithm ID is unknown (`UnknownAlgorithm`)
+    /// - The integrity hash does not match (`IntegrityMismatch`)
+    pub fn unpack(data: &[u8]) -> Result<Self, MerkleError> {
         if data.len() != MERKLE_ATTR_SIZE {
-            return None;
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::WrongSize,
+            });
         }
 
-        let mut root = [0u8; HASH_SIZE];
-        root.copy_from_slice(&data[0..HASH_SIZE]);
+        let mut root = [0u8; ATTR_ROOT_SIZE];
+        root.copy_from_slice(&data[ATTR_ROOT_OFFSET..ATTR_ROOT_END]);
 
-        let alg_id = data[HASH_SIZE];
-        let algorithm = HashAlg::from_id(alg_id)?;
+        let alg_id = data[ATTR_ALG_OFFSET];
+        let algorithm = HashAlg::from_id(alg_id).ok_or(MerkleError::InvalidAttribute {
+            reason: InvalidAttrReason::UnknownAlgorithm,
+        })?;
 
-        let mut integrity = [0u8; HASH_SIZE];
-        integrity.copy_from_slice(&data[HASH_SIZE + 1..]);
+        let mut integrity = [0u8; ATTR_INTEGRITY_SIZE];
+        integrity.copy_from_slice(&data[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END]);
 
         // Verify integrity hash
         let expected_integrity = Self::compute_integrity(&root, algorithm);
         if !constant_time_eq(&integrity, &expected_integrity) {
-            return None;
+            return Err(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::IntegrityMismatch,
+            });
         }
 
-        Some(Self {
+        Ok(Self {
             root,
             algorithm,
             integrity,
@@ -859,6 +920,11 @@ impl MerkleAttr {
 /// * `dataset` - The dataset builder to add the attribute to
 /// * `tree` - The Merkle tree to store
 ///
+/// # Errors
+///
+/// Currently infallible, but returns `Result` to allow future extension
+/// for HDF5 write error handling without breaking API changes.
+///
 /// # Example
 ///
 /// ```ignore
@@ -871,15 +937,16 @@ impl MerkleAttr {
 /// let mut fw = FileWriter::new();
 /// let ds = fw.create_dataset("data");
 /// ds.with_u8_data(&[1, 2, 3, 4, 5, 6]);
-/// write_merkle_attr(ds, &tree);
+/// write_merkle_attr(ds, &tree)?;
 /// ```
 pub fn write_merkle_attr(
     dataset: &mut crate::type_builders::DatasetBuilder,
     tree: &MerkleTree,
-) {
+) -> Result<(), MerkleError> {
     let attr = MerkleAttr::from_tree(tree);
     let packed = attr.pack();
     dataset.set_attr(MERKLE_ATTR_NAME, crate::type_builders::AttrValue::Bytes(packed.to_vec()));
+    Ok(())
 }
 
 // ============================================================================
@@ -1154,6 +1221,80 @@ mod tests {
         // Access padding slots directly from nodes
         for i in 5..8 {
             assert_eq!(tree.nodes()[internal_nodes + i], null_sentinel);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn test_three_leaf_tree_manual_verification() {
+        // 3-leaf tree tests padding with null sentinel
+        // Tree structure (padded to 4 leaves):
+        //
+        //              root
+        //             /    \
+        //           n1      n2
+        //          / \     /  \
+        //        L0  L1   L2  NULL
+        //
+        let alg = HashAlg::Blake3;
+
+        // Create leaves with known inputs matching gen_merkle_vectors
+        let leaf0 = hash_chunk(b"leaf A", alg);
+        let leaf1 = hash_chunk(b"leaf B", alg);
+        let leaf2 = hash_chunk(b"leaf C", alg);
+        let null_sentinel = alg.null_sentinel();
+
+        // Build tree from leaf hashes
+        let tree =
+            MerkleTree::build(&[leaf0, leaf1, leaf2], alg).expect("build should succeed");
+
+        // Verify tree structure
+        assert_eq!(tree.leaf_count(), 3);
+        assert_eq!(tree.padded_leaf_count(), 4);
+        assert_eq!(tree.depth(), 3); // root + 1 internal level + leaves
+
+        // Manually compute expected internal nodes and root
+        // n1 = H(0x01 || L0 || L1)
+        let mut combined = [0u8; 65];
+        combined[0] = INTERNAL_PREFIX;
+        combined[1..33].copy_from_slice(&leaf0);
+        combined[33..65].copy_from_slice(&leaf1);
+        let n1: [u8; 32] = blake3::hash(&combined).into();
+
+        // n2 = H(0x01 || L2 || NULL)
+        combined[1..33].copy_from_slice(&leaf2);
+        combined[33..65].copy_from_slice(&null_sentinel);
+        let n2: [u8; 32] = blake3::hash(&combined).into();
+
+        // root = H(0x01 || n1 || n2)
+        combined[1..33].copy_from_slice(&n1);
+        combined[33..65].copy_from_slice(&n2);
+        let expected_root: [u8; 32] = blake3::hash(&combined).into();
+
+        assert_eq!(tree.root(), &expected_root, "3-leaf tree root mismatch");
+
+        // Verify the padding slot contains null sentinel
+        let internal_nodes = tree.padded_leaf_count() - 1; // 3
+        assert_eq!(
+            tree.nodes()[internal_nodes + 3],
+            null_sentinel,
+            "Padding slot should contain null sentinel"
+        );
+
+        // Verify proofs work for all 3 leaves
+        for i in 0..3 {
+            let proof = tree.proof(i).expect("proof should exist");
+            let chunk = match i {
+                0 => b"leaf A".as_slice(),
+                1 => b"leaf B".as_slice(),
+                2 => b"leaf C".as_slice(),
+                _ => unreachable!(),
+            };
+            assert!(
+                tree.verify_proof(i, chunk, &proof),
+                "Proof verification failed for leaf {}",
+                i
+            );
         }
     }
 
@@ -1444,7 +1585,7 @@ mod tests {
 
         // Unpack should fail due to integrity mismatch
         assert!(
-            MerkleAttr::unpack(&packed).is_none(),
+            MerkleAttr::unpack(&packed).is_err(),
             "Tampered algorithm ID should fail integrity check"
         );
     }
@@ -1464,7 +1605,7 @@ mod tests {
 
         // Unpack should fail due to integrity mismatch
         assert!(
-            MerkleAttr::unpack(&packed).is_none(),
+            MerkleAttr::unpack(&packed).is_err(),
             "Tampered root hash should fail integrity check"
         );
     }
@@ -1491,11 +1632,11 @@ mod tests {
     #[test]
     fn test_merkle_attr_invalid_size() {
         // Too short
-        assert!(MerkleAttr::unpack(&[0u8; 64]).is_none());
+        assert!(MerkleAttr::unpack(&[0u8; 64]).is_err());
         // Too long
-        assert!(MerkleAttr::unpack(&[0u8; 66]).is_none());
+        assert!(MerkleAttr::unpack(&[0u8; 66]).is_err());
         // Empty
-        assert!(MerkleAttr::unpack(&[]).is_none());
+        assert!(MerkleAttr::unpack(&[]).is_err());
     }
 
     #[test]
@@ -1512,7 +1653,7 @@ mod tests {
         ds.with_u8_data(&[1, 2, 3, 4]);
 
         // Write merkle attribute
-        write_merkle_attr(ds, &tree);
+        write_merkle_attr(ds, &tree).expect("write_merkle_attr should succeed");
 
         // Finish and verify the file is valid
         let bytes = fw.finish().expect("file should build");

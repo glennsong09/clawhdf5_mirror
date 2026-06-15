@@ -68,6 +68,52 @@ fn main() {
     // Verify our manual computation matches
     assert_eq!(&root2, tree2.root(), "Two-leaf root mismatch");
 
+    // Three leaf test (BLAKE3) - demonstrates null sentinel padding
+    // Tree structure:
+    //              root
+    //             /    \
+    //           n1      n2
+    //          / \     /  \
+    //        L0  L1   L2  NULL
+    const NULL_PREFIX: u8 = 0x02;
+    // null_sentinel = H(0x02 || "null")
+    let mut null_data = [0u8; 5]; // 1 byte prefix + 4 bytes "null"
+    null_data[0] = NULL_PREFIX;
+    null_data[1..].copy_from_slice(b"null");
+    let null_sentinel: [u8; 32] = blake3::hash(&null_data).into();
+
+    let leaf_a = hash_chunk(b"leaf A", HashAlg::Blake3);
+    let leaf_b = hash_chunk(b"leaf B", HashAlg::Blake3);
+    let leaf_c = hash_chunk(b"leaf C", HashAlg::Blake3);
+
+    let tree3 = MerkleTree::build(&[leaf_a, leaf_b, leaf_c], HashAlg::Blake3).unwrap();
+
+    // n1 = H(0x01 || leaf_a || leaf_b)
+    let n1_3 = hash_pair_blake3(&leaf_a, &leaf_b);
+    // n2 = H(0x01 || leaf_c || null_sentinel)
+    let n2_3 = hash_pair_blake3(&leaf_c, &null_sentinel);
+    // root = H(0x01 || n1 || n2)
+    let root3 = hash_pair_blake3(&n1_3, &n2_3);
+
+    assert_eq!(&root3, tree3.root(), "Three-leaf root mismatch");
+
+    println!("  \"three_leaf_blake3\": {{");
+    println!("    \"note\": \"3 leaves padded to 4 with null sentinel\",");
+    println!("    \"inputs\": [\"leaf A\", \"leaf B\", \"leaf C\"],");
+    println!("    \"leaf_hashes\": [");
+    println!("      \"{}\",", hex(&leaf_a));
+    println!("      \"{}\",", hex(&leaf_b));
+    println!("      \"{}\"", hex(&leaf_c));
+    println!("    ],");
+    println!("    \"null_sentinel\": \"{}\",", hex(&null_sentinel));
+    println!("    \"internal_nodes\": {{");
+    println!("      \"n1_H(L0,L1)\": \"{}\",", hex(&n1_3));
+    println!("      \"n2_H(L2,NULL)\": \"{}\"", hex(&n2_3));
+    println!("    }},");
+    println!("    \"root\": \"{}\",", hex(tree3.root()));
+    println!("    \"computation\": \"H(0x01 || H(0x01||L0||L1) || H(0x01||L2||NULL))\"");
+    println!("  }},");
+
     // Eight leaf test (BLAKE3)
     let leaves: Vec<[u8; 32]> = (0u8..8)
         .map(|i| hash_chunk(&[b'L', i], HashAlg::Blake3))

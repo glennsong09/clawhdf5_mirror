@@ -21,6 +21,22 @@
     "root": "609e5e93238d9d06bcd2c13bacaf8cd82ee62cf2f0e191c60e50b7100b5973f8",
     "computation": "H(0x01 || leaf0 || leaf1)"
   },
+  "three_leaf_blake3": {
+    "note": "3 leaves padded to 4 with null sentinel",
+    "inputs": ["leaf A", "leaf B", "leaf C"],
+    "leaf_hashes": [
+      "2648e4d4d0eb745c93f406ff86638129b644be5823f43d6a19e7b062c381695a",
+      "3ec9118c6591608b95afa656cf6ec5be1cb55e0e1904ec29d999288cb98c3924",
+      "21449b245e16b26aae47cac09795315185ee2d3fe0084d846f2d613fbc8fd3e2"
+    ],
+    "null_sentinel": "db05fee739af27bd3ce4996285dc6e1736f2e7813fb7466f6ffeb1ec787e6f8d",
+    "internal_nodes": {
+      "n1_H(L0,L1)": "3924b607b1cf0a5afe5ae6dd818b47faf05fb3c85890fc7b1fb71c7a340d13d4",
+      "n2_H(L2,NULL)": "2926eb13bbe890d1a10b01027661b2b9d990a4250684df710f99110013a523cb"
+    },
+    "root": "4af3ce0251640765d2e85e7ce56b234249604e8a6df2ddd1c76bd325ac63d866",
+    "computation": "H(0x01 || H(0x01||L0||L1) || H(0x01||L2||NULL))"
+  },
   "eight_leaf_blake3": {
     "inputs": ["L\\x00", "L\\x01", "L\\x02", "L\\x03", "L\\x04", "L\\x05", "L\\x06", "L\\x07"],
     "leaf_hashes": [
