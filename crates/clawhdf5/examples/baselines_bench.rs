@@ -20,10 +20,12 @@
 //! committing it deliberately).
 //!
 //! NOAA_PATH/NOAA_DATASET are optional: if given, the harness additionally
-//! extracts real chunks from that dataset (uncompressed chunked layouts
-//! only) and reruns the same suite tagged `source=NOAA`. If extraction
-//! fails or the dataset is unsuitable, that source is skipped with a
-//! printed warning rather than aborting the synthetic run.
+//! extracts real on-disk chunk bytes from that dataset (filtered/compressed
+//! chunks are hashed as-is, same as the existing filter-agnostic Merkle
+//! code) and reruns the same suite tagged `source=NOAA`. If extraction
+//! fails or the chunk-index type is unsupported, that source is skipped
+//! with a printed warning rather than aborting the synthetic run. Defaults
+//! to the `Rad` dataset (GOES-18 ABI L1b radiance) when present.
 
 use clawhdf5::File;
 use clawhdf5_format::baselines::{
@@ -428,10 +430,16 @@ fn bench_cell(
     });
 }
 
-/// Best-effort extraction of raw chunk bytes from a real HDF5/NetCDF-4 file,
-/// for an uncompressed chunked dataset. Returns `None` (with a printed
-/// warning) rather than erroring out, since the NOAA leg of this harness is
-/// optional.
+/// Best-effort extraction of raw on-disk chunk bytes from a real HDF5/
+/// NetCDF-4 file. Returns `None` (with a printed warning) rather than
+/// erroring out, since the NOAA leg of this harness is optional.
+///
+/// The bytes returned are whatever is physically stored per chunk —
+/// filtered/compressed if the dataset uses a filter pipeline. The baseline
+/// backends (like `merkle.rs`) are filter-agnostic: they hash/sign whatever
+/// byte slice they're given, so this matches how the existing Merkle code
+/// treats chunks and lets the harness run against real (compressed) NOAA
+/// products instead of only the synthetic, uncompressed data.
 fn extract_noaa_chunks(
     path: &str,
     dataset_override: Option<&str>,
@@ -444,9 +452,13 @@ fn extract_noaa_chunks(
         }
     };
     let datasets = file.root().datasets().ok()?;
-    let test_dataset = dataset_override
-        .map(|s| s.to_string())
-        .or_else(|| datasets.first().cloned())?;
+    let test_dataset = dataset_override.map(|s| s.to_string()).or_else(|| {
+        if datasets.contains(&"Rad".to_string()) {
+            Some("Rad".to_string())
+        } else {
+            datasets.first().cloned()
+        }
+    })?;
 
     let file_data = fs::read(path).ok()?;
     let sig_offset = signature::find_signature(&file_data).ok()?;
@@ -465,11 +477,11 @@ fn extract_noaa_chunks(
         .iter()
         .find(|m| m.msg_type == MessageType::FilterPipeline)
         .and_then(|msg| FilterPipeline::parse(&msg.data).ok());
-    if pipeline.is_some() {
-        eprintln!(
-            "warning: dataset '{test_dataset}' is compressed; skipping NOAA leg (backends need raw bytes)"
+    if let Some(p) = &pipeline {
+        println!(
+            "  note: dataset '{test_dataset}' has {} filter(s) applied; hashing on-disk (filtered) chunk bytes",
+            p.filters.len()
         );
-        return None;
     }
 
     let layout_msg = header
