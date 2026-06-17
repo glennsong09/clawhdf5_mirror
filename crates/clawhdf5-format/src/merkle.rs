@@ -1324,106 +1324,6 @@ pub const MERKLE_NODES_ATTR_NAME: &str = "merkle_nodes";
 /// Name of the group containing companion merkle datasets.
 pub const MERKLE_GROUP_NAME: &str = "merkle";
 
-/// Pending companion dataset to be written.
-#[derive(Debug, Clone)]
-struct PendingCompanion {
-    name: String,
-    data: Vec<u8>,
-}
-
-/// Batched writer for merkle companion datasets.
-///
-/// Collects companion datasets and writes them to a single `/merkle` group
-/// when finalized. This avoids creating duplicate groups when multiple
-/// datasets require companion storage.
-///
-/// # Example
-///
-/// ```ignore
-/// use clawhdf5_format::merkle::{MerkleTree, HashAlg, MerkleCompanionWriter};
-/// use clawhdf5_format::file_writer::FileWriter;
-///
-/// let mut fw = FileWriter::new();
-/// let mut companion_writer = MerkleCompanionWriter::new();
-///
-/// // Add multiple datasets with merkle trees
-/// let tree1 = MerkleTree::from_chunks(&chunks1, HashAlg::Blake3);
-/// let result1 = companion_writer.add("dataset1", &tree1);
-///
-/// let tree2 = MerkleTree::from_chunks(&chunks2, HashAlg::Blake3);
-/// let result2 = companion_writer.add("dataset2", &tree2);
-///
-/// // Write all companion datasets to a single /merkle group
-/// companion_writer.finish(&mut fw);
-/// ```
-#[derive(Debug, Default)]
-pub struct MerkleCompanionWriter {
-    pending: Vec<PendingCompanion>,
-}
-
-impl MerkleCompanionWriter {
-    /// Create a new companion writer.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { pending: Vec::new() }
-    }
-
-    /// Add a merkle tree's nodes, returning the storage result.
-    ///
-    /// For trees with ≤256 chunks, returns `Inline` with the packed nodes.
-    /// For larger trees, queues the companion dataset and returns `Dataset`.
-    pub fn add(&mut self, name: &str, tree: &MerkleTree) -> MerkleCompanionResult {
-        let nodes = tree.nodes();
-        let mut flat_nodes = Vec::with_capacity(nodes.len() * HASH_SIZE);
-        for node in nodes {
-            flat_nodes.extend_from_slice(node);
-        }
-
-        let companion_hash = compute_sha256(&flat_nodes);
-
-        if tree.leaf_count() <= INLINE_CHUNK_THRESHOLD {
-            MerkleCompanionResult::Inline {
-                nodes: flat_nodes,
-                companion_hash,
-            }
-        } else {
-            self.pending.push(PendingCompanion {
-                name: name.to_string(),
-                data: flat_nodes,
-            });
-            MerkleCompanionResult::Dataset { companion_hash }
-        }
-    }
-
-    /// Write all pending companion datasets to a single `/merkle` group.
-    ///
-    /// Does nothing if no datasets require companion storage.
-    pub fn finish(self, file: &mut crate::file_writer::FileWriter) {
-        if self.pending.is_empty() {
-            return;
-        }
-
-        let mut group = file.create_group(MERKLE_GROUP_NAME);
-        for companion in self.pending {
-            let ds = group.create_dataset(&companion.name);
-            ds.with_u8_data(&companion.data);
-        }
-        file.add_group(group.finish());
-    }
-
-    /// Check if any companion datasets are pending.
-    #[must_use]
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// Get the number of pending companion datasets.
-    #[must_use]
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-}
-
 /// Result of `write_merkle_companion` indicating storage method and companion hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MerkleCompanionResult {
@@ -1451,7 +1351,7 @@ pub enum MerkleCompanionResult {
 ///
 /// **Warning**: This function creates a new `/merkle` group each time it's called
 /// for a large dataset. For files with multiple datasets requiring companion storage,
-/// use [`MerkleCompanionWriter`] instead to batch writes to a single group.
+/// ensure you only call this function once per file, or manually manage group creation.
 ///
 /// For datasets with 256 or fewer chunks, returns packed node hashes that
 /// should be written as a `merkle_nodes` attribute on the dataset. For larger
