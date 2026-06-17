@@ -19,6 +19,9 @@ lz4_flex = { version = "0.11", optional = true }
 zstd = { version = "0.13", optional = true }
 blake3 = { version = "1", optional = true }
 k12 = { version = "0.3", optional = true }
+hmac = { version = "0.12", optional = true, default-features = false }
+ed25519_dalek = { package = "ed25519-dalek", version = "2", optional = true, default-features = false, features = ["rand_core", "zeroize"] }
+rand_core = { version = "0.6", optional = true, default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
 serde_json = "1"
@@ -46,6 +49,7 @@ zstd = ["dep:zstd"]
 blake3_hash = ["blake3"]
 k12_hash = ["k12"]
 merkle = ["sha2", "blake3", "k12"]
+baselines = ["sha2", "hmac", "ed25519_dalek", "rand_core"]
 
 [[bench]]
 name = "parallel_decompress_bench"

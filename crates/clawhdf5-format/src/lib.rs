@@ -50,6 +50,8 @@ extern crate alloc;
 
 pub mod attribute;
 pub mod attribute_info;
+#[cfg(feature = "baselines")]
+pub mod baselines;
 pub mod btree_v1;
 pub mod btree_v2;
 pub mod checksum;
