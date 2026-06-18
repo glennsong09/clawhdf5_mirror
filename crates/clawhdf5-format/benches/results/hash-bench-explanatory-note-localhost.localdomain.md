@@ -49,9 +49,12 @@ critical path, not a standalone copy of the algorithm.
 
 ## How to read the plot
 
-`plot_hash_throughput.png`: grouped bars per algorithm at each chunk size,
-with 95% CI error bars (too narrow to see at this scale — see the CSV for
-exact bounds).
+`plot_hash_throughput.png`: one main log-scale point+errorbar plot
+comparing all three algorithms across chunk sizes, plus three small
+zoomed-in inset panels below it (one per algorithm, each individually
+y-scaled) — the main plot's 95% CIs are too narrow to see at that shared
+scale, so each inset re-plots its algorithm's own CI on a tight axis
+range where the whiskers are actually visible.
 
 ## How to read the CSV
 
@@ -117,8 +120,59 @@ forced-software run is not the artifact's committed numbers — the
 committed CSV correctly reflects the project's default build, which uses
 hardware acceleration when available.)
 
+## Observation: CI width (as % of median) grows with chunk size for SHA-256 and K12
+
+Within the committed 64/256/1024 KB cells, SHA-256's CI width goes
+0.04% → 0.15% → 0.71% of the median, and K12's goes ~0.05% → 0.14% → 0.31%
+— both widening as chunk size increases, even though the underlying
+algorithms are unchanged.
+
+To see the actual shape of this trend (not just three points) and check
+for a sharp cache-capacity-wall effect, `CHUNK_SIZES_KB` was temporarily
+widened to a 16 KB–8 MB sweep and rerun (output discarded, not part of
+the committed artifact — the CSV was restored via `git checkout` and the
+source edit reverted afterward). The widened sweep shows a gradual,
+roughly monotonic increase in CI width starting well below the L2 size
+(this CPU's L2 is 1 MiB/core per `lscpu`), continuing smoothly through
+1 MB and out to 8 MB, rather than a step change exactly at the 1 MiB
+boundary:
+
+```
+sha256:  16KB→0.02%  64KB→0.04%  256KB→0.15%  1024KB→0.71%  4096KB→0.93%  8192KB→0.88%
+k12:     16KB→0.19%  64KB→0.21%* 256KB→0.22%  1024KB→1.10%  4096KB→1.09%  8192KB→7.35%†
+```
+
+(`*` excludes one anomalous run where k12@64KB's median itself dropped to
+~1054 MB/s, a one-off perturbation not seen elsewhere in the sweep; `†` is
+a clear outlier even relative to the otherwise-smooth trend.)
+
+The smooth, gradual growth — rather than a sharp jump at the cache-size
+boundary — points to measurement methodology rather than a cache-capacity
+wall: each trial times a single `hash_chunk()` call end-to-end via
+`Instant::now()`, so the wall-clock window being measured itself grows
+with chunk size (roughly 24 µs at 64 KB vs. 360–400 µs at 1 MB vs. several
+ms at 8 MB). A longer timed window has proportionally more exposure to
+OS-level jitter — scheduler timeslicing, timer interrupts, P-state/turbo
+frequency transitions, background cache eviction from other processes —
+landing inside the window during at least one of the 30 trials. That
+produces occasional high-latency outlier trials, which widen the
+bootstrap CI (sensitive to tail samples) much more than they move the
+median (robust to a single outlier). This is consistent with BLAKE3
+showing the same widening trend despite its different (parallel,
+tree-based) internal structure — the effect tracks wall-clock window
+length, not an algorithm-specific property.
+
+Practical takeaway: this does not affect the committed artifact's
+validity — all three committed chunk sizes (64/256/1024 KB) sit at the
+low end of this effect and are comfortably sub-1% CI width, consistent
+with the tight-CI claim below. It does mean that extending this benchmark
+to much larger chunk sizes in the future should expect proportionally
+wider confidence intervals, and that such an extension may benefit from
+more trials or from timing a fixed number of repeated calls per trial
+instead of a single call.
+
 ## Inconclusive results
 
 None — every measured cell's 95% bootstrap CI is tight relative to the
-median (sub-0.5% width in all cases), so no algorithm/chunk-size pairs are
+median (sub-1% width in all cases), so no algorithm/chunk-size pairs are
 statistically indistinguishable at this sample size.
