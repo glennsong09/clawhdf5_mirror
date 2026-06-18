@@ -96,6 +96,43 @@ spread (min/max, IQR) can also be reported, e.g. in
   cross-chunk-size parallelism the way BLAKE3's tree does, so per-byte cost
   is roughly constant once warmed up.
 
+## Sanity check: is ~12.5 GB/s (~11.6 GiB/s) BLAKE3 throughput plausible?
+
+At 1 MB chunks, BLAKE3 measures ~12.5 GB/s decimal — about 4.6x SHA-256's
+throughput on the same hardware. That ratio is large enough to be worth
+independently verifying rather than trusting the harness's single-call
+`Instant::now()` timing at face value.
+
+Two checks:
+
+- **No multithreading is involved.** `Cargo.lock` confirms the `blake3`
+  crate dependency here pulls in no `rayon` (its optional multithreading
+  feature is not enabled), so every measured number is single-core.
+- **Independent cross-check with a different method.** A standalone
+  scratch program (separate from the harness and not part of this repo)
+  allocated a much larger 512 MiB in-memory buffer and called
+  `blake3::hash()` on it 10 times in a loop, timing the whole loop with
+  one coarse `Instant::now()` pair rather than the harness's
+  per-trial timing — a different buffer size and a different timing
+  method, to rule out the harness's specific approach being the source
+  of an inflated number. Result: **9.47 GiB/s**, the same order of
+  magnitude and consistent with the harness's measurement (some
+  difference is expected: this used a single combined timing of 10
+  iterations of a much larger 512 MiB buffer, vs. the harness's 30
+  separately-timed 1 MB calls).
+
+Why this is a real, expected property of BLAKE3 on this hardware rather
+than a bug: BLAKE3's tree structure splits its input into 1024-byte
+sub-chunks and hashes multiple of them **in parallel using SIMD lanes
+within a single core** (8-wide on AVX2, 16-wide on AVX-512) — this
+intra-call SIMD parallelism, not multithreading, is the documented
+mechanism by which BLAKE3 achieves much higher single-core throughput
+than tree-incapable hashes like SHA-256 or K12. This CPU has full AVX-512
+support (`avx512f`/`avx512bw`/`avx512vl`/etc. per `/proc/cpuinfo`) and Zen
+5 implements AVX-512 at full width rather than double-pumping it the way
+Zen 3/4 did, plus a high boost clock (~5.76 GHz per `lscpu`) — a
+particularly favorable combination for BLAKE3's SIMD-parallel design.
+
 ## Anomaly: SHA-256 is faster than K12, despite K12 being the
 "very fast" candidate
 
