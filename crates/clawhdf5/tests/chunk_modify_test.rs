@@ -8,12 +8,13 @@
 //! 5. Re-opening and verifying the modification without corruption
 
 use clawhdf5::{AttrValue, File, FileBuilder};
-use clawhdf5_format::chunked_read::ChunkInfo;
+use clawhdf5_format::chunked_read::{ChunkInfo, collect_chunk_info};
 use clawhdf5_format::data_layout::DataLayout;
 use clawhdf5_format::dataspace::Dataspace;
 use clawhdf5_format::datatype::Datatype;
+use clawhdf5_format::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
 use clawhdf5_format::filter_pipeline::FilterPipeline;
-use clawhdf5_format::fixed_array::{read_fixed_array_chunks, FixedArrayHeader};
+use clawhdf5_format::fixed_array::{FixedArrayHeader, read_fixed_array_chunks};
 use clawhdf5_format::group_v2;
 use clawhdf5_format::message_type::MessageType;
 use clawhdf5_format::object_header::ObjectHeader;
@@ -125,12 +126,40 @@ fn parse_dataset_and_chunks(
                         superblock.length_size,
                     )?
                 }
+                (4, Some(4)) => {
+                    // Extensible Array index
+                    let ea_header = ExtensibleArrayHeader::parse(
+                        file_data,
+                        addr as usize,
+                        superblock.offset_size,
+                        superblock.length_size,
+                    )?;
+                    read_extensible_array_chunks(
+                        file_data,
+                        &ea_header,
+                        &dataspace.dimensions,
+                        &spatial_chunk_dims,
+                        element_size as u32,
+                        superblock.offset_size,
+                        superblock.length_size,
+                    )?
+                }
+                (3, _) => {
+                    // B-tree v1
+                    collect_chunk_info(
+                        file_data,
+                        addr,
+                        rank + 1,
+                        superblock.offset_size,
+                        superblock.length_size,
+                    )?
+                }
                 _ => {
                     return Err(format!(
                         "Unsupported chunk index: version={}, type={:?}",
                         version, chunk_index_type
                     )
-                    .into())
+                    .into());
                 }
             }
         }
@@ -139,7 +168,7 @@ fn parse_dataset_and_chunks(
 
     let chunk_elements: usize = chunks
         .first()
-        .map(|c| {
+        .map(|_| {
             // Calculate from chunk offsets and dataset dims
             // For 1D, chunk size = chunk_dims[0]
             if let DataLayout::Chunked {
@@ -220,7 +249,6 @@ fn test_chunk_read_modify_write() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Iterate over every chunk and read raw bytes, compute checksums
     println!("\nStep 2: Reading all chunks and computing checksums...");
-    let chunk_bytes = chunk_elements * element_size;
     let mut chunk_checksums: Vec<u64> = Vec::with_capacity(chunks.len());
 
     for (i, chunk) in chunks.iter().enumerate() {
@@ -251,7 +279,10 @@ fn test_chunk_read_modify_write() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("\nStep 3: Modifying chunk {} in memory...", target_chunk_idx);
+    println!(
+        "\nStep 3: Modifying chunk {} in memory...",
+        target_chunk_idx
+    );
     let target_chunk = &chunks[target_chunk_idx];
     let chunk_start = target_chunk.address as usize;
     let chunk_end = chunk_start + target_chunk.chunk_size as usize;
@@ -299,8 +330,7 @@ fn test_chunk_read_modify_write() -> Result<(), Box<dyn std::error::Error>> {
     // Calculate which elements belong to the modified chunk based on its offset
     let chunk_offset = target_chunk.offsets[0] as usize; // 1D dataset, first offset is element index
     let chunk_start_element = chunk_offset;
-    let chunk_end_element =
-        std::cmp::min(chunk_start_element + chunk_elements, data_after.len());
+    let chunk_end_element = std::cmp::min(chunk_start_element + chunk_elements, data_after.len());
 
     println!(
         "  Checking modified chunk (elements {}..{})...",
@@ -463,7 +493,7 @@ fn test_chunk_iteration_large_file() -> Result<(), Box<dyn std::error::Error>> {
         let sig_offset = signature::find_signature(&file_data)?;
         let superblock = Superblock::parse(&file_data, sig_offset)?;
 
-        let (chunks, dataspace, datatype, _, element_size, chunk_elements) =
+        let (chunks, dataspace, _datatype, _, element_size, chunk_elements) =
             parse_dataset_and_chunks(&file_data, &superblock, "dataset_1mb")?;
 
         println!("Dataset shape: {:?}", dataspace.dimensions);
@@ -483,5 +513,117 @@ fn test_chunk_iteration_large_file() -> Result<(), Box<dyn std::error::Error>> {
         println!("Skipping large file test (set CLAWHDF5_LARGE_TEST_FILE to enable)");
     }
 
+    Ok(())
+}
+
+/// P1.1 step 4: repeat the modify/write-back/reopen round trip on a real
+/// NOAA sample file. Its `Rad` dataset is DEFLATE-filtered, so the on-disk
+/// bytes we overwrite are compressed — we don't assert decoded values (the
+/// uncompressed case is already covered by `test_chunk_read_modify_write`
+/// above), only that the write lands, adjacent chunks stay intact, and the
+/// file still re-opens cleanly afterward.
+#[test]
+fn test_noaa_chunk_modify_write() -> Result<(), Box<dyn std::error::Error>> {
+    let Ok(path) = std::env::var("CLAWHDF5_NOAA_TEST_FILE") else {
+        println!("Skipping NOAA chunk modify test (set CLAWHDF5_NOAA_TEST_FILE to enable)");
+        return Ok(());
+    };
+    let dataset_name = std::env::var("CLAWHDF5_NOAA_DATASET").unwrap_or_else(|_| "Rad".to_string());
+
+    let file_data = std::fs::read(&path)?;
+    let sig_offset = signature::find_signature(&file_data)?;
+    let superblock = Superblock::parse(&file_data, sig_offset)?;
+
+    let (chunks, dataspace, _datatype, pipeline, _element_size, _chunk_elements) =
+        parse_dataset_and_chunks(&file_data, &superblock, &dataset_name)?;
+    println!(
+        "Dataset '{dataset_name}': shape={:?}, {} chunks, {} filter(s)",
+        dataspace.dimensions,
+        chunks.len(),
+        pipeline.as_ref().map_or(0, |p| p.filters.len())
+    );
+    assert!(
+        chunks.len() > 1,
+        "need at least 2 chunks to test adjacent-chunk integrity"
+    );
+
+    let mut original_checksums: Vec<u64> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        let start = chunk.address as usize;
+        let end = start + chunk.chunk_size as usize;
+        assert!(end <= file_data.len(), "chunk extends past EOF");
+        original_checksums.push(file_data[start..end].iter().map(|&b| b as u64).sum());
+    }
+
+    let target_idx = 1;
+    let target = &chunks[target_idx];
+    let start = target.address as usize;
+    let end = start + target.chunk_size as usize;
+    let original_bytes = file_data[start..end].to_vec();
+    let mut modified_bytes = original_bytes.clone();
+    for b in &mut modified_bytes {
+        *b = !*b;
+    }
+
+    {
+        let mut fh = OpenOptions::new().write(true).open(&path)?;
+        fh.seek(SeekFrom::Start(target.address))?;
+        fh.write_all(&modified_bytes)?;
+        fh.sync_all()?;
+    }
+
+    let reopened = File::open(&path);
+    let file_data_after = std::fs::read(&path)?;
+    let written_bytes_match = file_data_after[start..end] == modified_bytes[..];
+    let mut other_chunks_intact = true;
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == target_idx {
+            continue;
+        }
+        let s = chunk.address as usize;
+        let e = s + chunk.chunk_size as usize;
+        let checksum: u64 = file_data_after[s..e].iter().map(|&b| b as u64).sum();
+        if checksum != original_checksums[i] {
+            println!("  ERROR: chunk {i} corrupted");
+            other_chunks_intact = false;
+        }
+    }
+    let reopened_dataset_ok = reopened
+        .as_ref()
+        .ok()
+        .and_then(|f| f.dataset(&dataset_name).ok())
+        .and_then(|d| d.shape().ok())
+        .is_some();
+
+    // Restore the original bytes before any assertion can leave the user's
+    // real downloaded file corrupted on disk if something below fails.
+    {
+        let mut fh = OpenOptions::new().write(true).open(&path)?;
+        fh.seek(SeekFrom::Start(target.address))?;
+        fh.write_all(&original_bytes)?;
+        fh.sync_all()?;
+    }
+
+    assert!(
+        reopened.is_ok(),
+        "file did not re-open cleanly after the write"
+    );
+    assert!(
+        reopened_dataset_ok,
+        "dataset metadata unreadable after the write"
+    );
+    assert!(
+        written_bytes_match,
+        "modified chunk bytes were not persisted to disk"
+    );
+    assert!(
+        other_chunks_intact,
+        "adjacent chunks were corrupted by the write"
+    );
+
+    println!(
+        "=== TEST PASSED === modified chunk {target_idx} and restored it without corrupting the other {} chunks",
+        chunks.len() - 1
+    );
     Ok(())
 }

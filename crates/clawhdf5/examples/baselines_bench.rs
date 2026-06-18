@@ -37,6 +37,18 @@
 //! rows for `sig_mldsa` (ML-DSA-65 hybrid, deferred to Phase 2 — not
 //! implemented, so every metric is recorded as unsupported rather than
 //! silently omitted from the matrix).
+//!
+//! Statistical protocol (S2-D2 spec, p.52): each backend runs
+//! [`WARMUP_TRIALS`] discarded warmup iterations before the `TRIALS`
+//! measured ones; the CSV's `trial` column only covers the measured
+//! iterations (1..=TRIALS). The capability matrix reports each time metric
+//! as the median plus a 95% bootstrap confidence interval (never a bare
+//! mean), per [`bootstrap_median_ci`]. The CSV itself begins with a `#`
+//! comment line recording hostname, CPU model, RAM size, and UTC date, per
+//! the artifact-convention requirement that benchmark files remain
+//! interpretable after the machine changes. See the accompanying
+//! `baselines-explanatory-note-$(hostname).md` for the required reproducible
+//! explanatory note and trend/anomaly analysis.
 
 use clawhdf5::File;
 use clawhdf5_format::baselines::{
@@ -57,6 +69,16 @@ use std::fs;
 use std::time::Instant;
 
 const CHUNK_SIZES_KB: &[usize] = &[64, 256, 1024];
+
+/// Discarded warmup iterations run (and not recorded) before the `trials`
+/// measured iterations, per the Statistical Protocol (S2-D2 spec, p.52:
+/// "minimum 30 trials after 5 discarded warmups").
+const WARMUP_TRIALS: usize = 5;
+
+/// Bootstrap resamples used to compute the 95% CI on the median (p.52:
+/// "reported with a measure of central tendency and dispersion (median plus
+/// 95% bootstrap confidence interval, never a single bare number)").
+const BOOTSTRAP_ITERATIONS: usize = 2000;
 
 struct Row {
     backend: &'static str,
@@ -100,6 +122,95 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn ram_gb() -> f64 {
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .map(|kb| kb / 1024.0 / 1024.0)
+        .unwrap_or(f64::NAN)
+}
+
+fn now_utc_iso() -> String {
+    std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Minimal xorshift64* PRNG so bootstrap resampling needs no extra
+/// dependency; not cryptographic, just a deterministic resampler.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_index(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+fn median(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    let mut s = samples.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = (p * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Median plus 95% bootstrap confidence interval, per the Statistical
+/// Protocol (S2-D2 spec, p.52). `seed` only needs to differ across call
+/// sites to avoid correlated resampling; it is not a security boundary.
+fn bootstrap_median_ci(samples: &[f64], seed: u64) -> (f64, f64, f64) {
+    if samples.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    if samples.len() == 1 {
+        return (samples[0], samples[0], samples[0]);
+    }
+    let mut rng = Xorshift64(seed | 1);
+    let n = samples.len();
+    let mut medians: Vec<f64> = Vec::with_capacity(BOOTSTRAP_ITERATIONS);
+    for _ in 0..BOOTSTRAP_ITERATIONS {
+        let resample: Vec<f64> = (0..n).map(|_| samples[rng.next_index(n)]).collect();
+        medians.push(median(&resample));
+    }
+    medians.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        median(samples),
+        percentile(&medians, 0.025),
+        percentile(&medians, 0.975),
+    )
+}
+
 /// Deterministic, non-trivially-compressible chunk data — same pattern as
 /// `hash_bench.rs::make_chunk`, salted by chunk index so chunks differ.
 fn make_chunk(size: usize, idx: usize) -> Vec<u8> {
@@ -123,6 +234,16 @@ fn bench_cell(
     }
 
     // --- flat hash ---
+    for _ in 0..WARMUP_TRIALS {
+        let backend = FlatHashBackend::commit(chunks);
+        let _ = backend.verify_dataset(chunks);
+        let mut all: Vec<&[u8]> = chunks.to_vec();
+        let extra = make_chunk(chunk_size_kb * 1024, n_chunks);
+        all.push(&extra);
+        let mut mutable_backend = backend;
+        mutable_backend.append(&all);
+        mutable_backend.update(&all);
+    }
     for trial in 1..=trials {
         let start = Instant::now();
         let backend = FlatHashBackend::commit(chunks);
@@ -229,6 +350,15 @@ fn bench_cell(
     });
 
     // --- per-chunk MAC ---
+    for _ in 0..WARMUP_TRIALS {
+        let mut backend = PerChunkMacBackend::commit(chunks);
+        let _ = backend.verify_chunk(0, chunks[0]);
+        let _ = backend.verify_dataset(chunks);
+        let extra = make_chunk(chunk_size_kb * 1024, n_chunks);
+        backend.append(&extra);
+        let updated = make_chunk(chunk_size_kb * 1024, 0xDEAD);
+        let _ = backend.update(0, &updated);
+    }
     for trial in 1..=trials {
         let start = Instant::now();
         let mut backend = PerChunkMacBackend::commit(chunks);
@@ -329,6 +459,15 @@ fn bench_cell(
     });
 
     // --- per-chunk Ed25519 ---
+    for _ in 0..WARMUP_TRIALS {
+        let mut backend = PerChunkSigBackend::commit(chunks);
+        let _ = backend.verify_chunk(0, chunks[0]);
+        let _ = backend.verify_dataset(chunks);
+        let extra = make_chunk(chunk_size_kb * 1024, n_chunks);
+        backend.append(&extra);
+        let updated = make_chunk(chunk_size_kb * 1024, 0xDEAD);
+        let _ = backend.update(0, &updated);
+    }
     for trial in 1..=trials {
         let start = Instant::now();
         let mut backend = PerChunkSigBackend::commit(chunks);
@@ -645,12 +784,19 @@ fn add_ed25519_projection(rows: &mut Vec<Row>, chunk_size_kb: usize, source: &'s
         return;
     }
 
-    let mean_commit_ns = commit_samples.iter().sum::<f64>() / commit_samples.len() as f64;
-    let per_chunk_sign_ns = mean_commit_ns / n_chunks as f64;
+    let (median_commit_ns, lo_commit_ns, hi_commit_ns) = bootstrap_median_ci(
+        &commit_samples,
+        0xA5A5_A5A5_A5A5_A5A5 ^ chunk_size_kb as u64,
+    );
+    let per_chunk_sign_ns = median_commit_ns / n_chunks as f64;
     let per_chunk_storage_bytes = metadata_bytes.value / n_chunks as f64;
 
     let projected_storage_bytes = PROJECTED_N * per_chunk_storage_bytes;
     let projected_signing_cpu_hours = (PROJECTED_N * per_chunk_sign_ns) / 1e9 / 3600.0;
+    let projected_signing_cpu_hours_lo =
+        (PROJECTED_N * lo_commit_ns / n_chunks as f64) / 1e9 / 3600.0;
+    let projected_signing_cpu_hours_hi =
+        (PROJECTED_N * hi_commit_ns / n_chunks as f64) / 1e9 / 3600.0;
 
     rows.push(Row {
         backend: "sig_ed25519",
@@ -676,9 +822,13 @@ fn add_ed25519_projection(rows: &mut Vec<Row>, chunk_size_kb: usize, source: &'s
     });
     println!(
         "  N=1e7 Ed25519 projection ({chunk_size_kb} KB chunks, {source}): \
-         storage={:.1} MB, signing={:.3} CPU-hours (single core)",
+         storage={:.1} MB, signing={:.3} CPU-hours [95% CI {:.3}, {:.3}] (single core, \
+         median of {} measured commit_time trials)",
         projected_storage_bytes / 1e6,
-        projected_signing_cpu_hours
+        projected_signing_cpu_hours,
+        projected_signing_cpu_hours_lo,
+        projected_signing_cpu_hours_hi,
+        commit_samples.len()
     );
 }
 
@@ -735,8 +885,19 @@ fn write_capability_matrix(
     let mut md = String::new();
     md.push_str("# P1.2b Capability Matrix\n\n");
     md.push_str(&format!(
-        "Representative cell: chunk_size={chunk_size_kb} KB, source={source} \
-         (time metrics averaged over all trials).\n\n"
+        "Representative cell: chunk_size={chunk_size_kb} KB, source={source}. Time metrics \
+         are median over {} measured trials (after {WARMUP_TRIALS} discarded warmups) with a \
+         95% bootstrap confidence interval in brackets ({BOOTSTRAP_ITERATIONS} resamples). \
+         Deterministic, non-time metrics (metadata_bytes, public_verification, \
+         subset_proof_bytes) show the single measured value with no CI.\n\n",
+        rows.iter()
+            .filter(|r| {
+                r.backend == "flat"
+                    && r.metric == "commit_time"
+                    && r.chunk_size_kb == chunk_size_kb
+                    && r.source == source
+            })
+            .count()
     ));
     md.push_str(
         "| metric | flat (SHA-256) | mac (HMAC-SHA-256) | sig_ed25519 | sig_mldsa (ML-DSA-65) |\n",
@@ -770,12 +931,23 @@ fn write_capability_matrix(
                 md.push_str(&format!(" {why} |"));
                 continue;
             }
-            let mean = matching.iter().map(|r| r.value).sum::<f64>() / matching.len() as f64;
             let unit = matching[0].unit;
-            let formatted = match unit {
-                "ns" => format!("{:.0} ns", mean),
-                "bool" => (if mean >= 1.0 { "Yes" } else { "No" }).to_string(),
-                _ => format!("{:.0} {unit}", mean),
+            let formatted = if matching.len() > 1 {
+                let values: Vec<f64> = matching.iter().map(|r| r.value).collect();
+                let seed = 0x9E37_79B9_7F4A_7C15
+                    ^ (backend.len() as u64)
+                    ^ (metric.len() as u64).wrapping_mul(31);
+                let (med, lo, hi) = bootstrap_median_ci(&values, seed);
+                match unit {
+                    "bool" => (if med >= 1.0 { "Yes" } else { "No" }).to_string(),
+                    _ => format!("{med:.0} {unit} [95% CI {lo:.0}, {hi:.0}]"),
+                }
+            } else {
+                let v = matching[0].value;
+                match unit {
+                    "bool" => (if v >= 1.0 { "Yes" } else { "No" }).to_string(),
+                    _ => format!("{v:.0} {unit}"),
+                }
             };
             md.push_str(&format!(" {formatted} |"));
         }
@@ -847,7 +1019,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&results_dir)?;
     let out_path = format!("{results_dir}/baselines-{host}.csv");
 
-    let mut csv = String::from(
+    let mut csv = format!(
+        "# hostname={host} cpu_model=\"{cpu}\" ram_gb={:.1} date={}\n",
+        ram_gb(),
+        now_utc_iso()
+    );
+    csv.push_str(
         "backend,metric,n_chunks,chunk_size_kb,value,unit,supported,source,trial,hostname,cpu_model\n",
     );
     for r in &rows {
