@@ -145,6 +145,48 @@ informative as nominal chunk size, not as a direct proxy for bytes
 processed. A follow-up improvement would be to plot NOAA by its actual
 on-disk chunk size instead of nominal size for a fairer cross-comparison.
 
+## Confirming/correcting the §4.3 N=1e7 projections
+
+Spec step 3 requires projecting per-chunk-sig storage and signing cost to
+N = 10^7 chunks and checking it against the figures cited in §4.3 (Table 1
+and its footnotes g/h/†): ~640 MB (Ed25519) / ~33 GB (ML-DSA-65) storage,
+and ~3 CPU-hours signing time.
+
+- **Ed25519 storage — confirmed.** 64 B/chunk × 10^7 chunks = 640.0 MB,
+  exactly matching the cited figure (`storage=640.0 MB` in every harness
+  projection line, independent of chunk size, since storage scales with
+  chunk *count* only).
+- **ML-DSA-65 storage — confirmed by arithmetic, not measured.**
+  Footnote g cites 3,309 B/chunk (FIPS 204 final); 3,309 B × 10^7 =
+  33.09 GB, consistent with the cited "~33 GB." `sig_mldsa` itself is
+  "not implemented (Phase 2)" in this harness (per the spec: the
+  ML-DSA-65 backend lands once the P2.1 signing crate is available), so
+  this is a check of the cited arithmetic, not an independent
+  hardware measurement.
+- **ML-DSA-65 signing (~3 CPU-hours) — cannot be confirmed yet.**
+  Footnote h's "~3 CPU-hours" is specifically the ML-DSA-65 estimate
+  (~1 ms/chunk × 10^7 chunks), not Ed25519. Since `sig_mldsa` is
+  unimplemented in Phase 1, there is no hardware measurement to compare
+  against this figure — it remains an open item for Phase 2, to be
+  re-checked once the ML-DSA-65 backend exists.
+- **Ed25519 signing — measured, and chunk-size dependent.** Table 1's
+  N=10^7 scenario is captioned "10 TB at 1 MB chunks," so the directly
+  comparable Ed25519 figure is the **1 MB** projection: **4.842
+  CPU-hours** [95% CI 4.838, 4.853] — higher than the ~3-CPU-hour figure
+  that footnote h attributes to ML-DSA-65, even though Ed25519 is the
+  cheaper-per-signature classical scheme. At smaller chunk sizes the
+  projection drops well below 3 hours (256 KB: 1.252 CPU-hours; 64 KB:
+  0.356 CPU-hours; NOAA's ~122 KB nominal: 0.298 CPU-hours), so a single
+  "~3-CPU-hour"-style number isn't meaningful for Ed25519 without fixing
+  the chunk size — signing cost here is driven by per-signature
+  overhead and chunk *count*, not bytes (see "Expected trends" above).
+  The elevated 1 MB-chunk figure is consistent with Anomaly 1: the
+  `fast`/precomputed-tables feature being disabled makes every
+  `sign()` call slower than it would be with default features enabled,
+  so 4.842 CPU-hours is itself a hardware-specific, build-configuration-
+  dependent number, not an intrinsic property of Ed25519 — re-enabling
+  `fast` would be expected to bring this below the ML-DSA-65 estimate.
+
 ## Inconclusive results
 
 None — every measured cell's 95% bootstrap CI is tight relative to the
