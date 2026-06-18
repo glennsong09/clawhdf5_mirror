@@ -93,6 +93,24 @@ low-power x86 part, or most current ARM cores without the ARMv8.2
 SHA3/SHA512 crypto extension), SHA-256 would be expected to fall back to
 software and K12 would likely come out ahead, matching §5.3's framing.
 
+**Confirmed experimentally.** The `sha2` crate exposes a `force-soft`
+feature that disables the hardware-accelerated path regardless of detected
+CPU support. Rebuilding and rerunning with it forced on:
+
+```bash
+cargo run -p clawhdf5-format --release --example hash_bench_harness \
+    --features "merkle,sha2/force-soft"
+```
+
+drops SHA-256 from ~2.70–2.72 GB/s to **~666–676 MB/s** at every chunk
+size — now *below* K12's ~1.56–1.61 GB/s, exactly the ordering §5.3
+predicts. This isolates the effect to the `sha_ni` hardware path (the only
+thing `force-soft` changes) rather than some other confound, confirming
+the root-cause explanation above rather than merely asserting it. (This
+forced-software run is not the artifact's committed numbers — the
+committed CSV correctly reflects the project's default build, which uses
+hardware acceleration when available.)
+
 ## Inconclusive results
 
 None — every measured cell's 95% bootstrap CI is tight relative to the
