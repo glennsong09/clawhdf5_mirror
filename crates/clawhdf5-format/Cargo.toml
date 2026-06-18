@@ -66,5 +66,9 @@ name = "gen_merkle_vectors"
 required-features = ["merkle"]
 
 [[example]]
+name = "hash_bench_harness"
+required-features = ["merkle"]
+
+[[example]]
 name = "write_merkle_test"
 required-features = ["merkle"]
