@@ -98,8 +98,7 @@ fn main() {
                 hostname.clone(),
             ));
         }
-        seq_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let seq_median = seq_times[n_trials / 2];
+        let seq_median = median(&mut seq_times);
         println!("median {:.2}ms", seq_median);
 
         // Parallel trials
@@ -119,8 +118,7 @@ fn main() {
                 hostname.clone(),
             ));
         }
-        par_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let par_median = par_times[n_trials / 2];
+        let par_median = median(&mut par_times);
         println!("median {:.2}ms", par_median);
 
         let speedup = seq_median / par_median;
@@ -135,6 +133,16 @@ fn main() {
     }
 
     println!("Results saved to: {}", output_path);
+}
+
+fn median(times: &mut [f64]) -> f64 {
+    times.sort_by(f64::total_cmp);
+    let mid = times.len() / 2;
+    if times.len() % 2 == 0 {
+        (times[mid - 1] + times[mid]) / 2.0
+    } else {
+        times[mid]
+    }
 }
 
 fn format_bytes(bytes: usize) -> String {

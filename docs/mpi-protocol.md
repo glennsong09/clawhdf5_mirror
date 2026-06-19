@@ -269,6 +269,22 @@ void merkle_lazy_flush(epoch_state_t *state,
     // Using custom datatype for (int, uint8_t[32]) pairs
     typedef struct { int idx; uint8_t hash[32]; } leaf_entry_t;
 
+    // NOTE: Use MPI_Type_create_struct to define leaf_entry_type, NOT
+    // MPI_Type_contiguous. The compiler may insert padding between
+    // `int idx` and `uint8_t hash[32]` for alignment. Example:
+    //
+    //   int blocklengths[2] = {1, 32};
+    //   MPI_Aint displacements[2];
+    //   MPI_Datatype types[2] = {MPI_INT, MPI_BYTE};
+    //   leaf_entry_t dummy;
+    //   MPI_Get_address(&dummy.idx, &displacements[0]);
+    //   MPI_Get_address(&dummy.hash, &displacements[1]);
+    //   displacements[1] -= displacements[0];
+    //   displacements[0] = 0;
+    //   MPI_Type_create_struct(2, blocklengths, displacements, types,
+    //                          &leaf_entry_type);
+    //   MPI_Type_commit(&leaf_entry_type);
+
     leaf_entry_t *my_entries = malloc(state->pending_count * sizeof(leaf_entry_t));
     for (int i = 0; i < state->pending_count; i++) {
         my_entries[i].idx = state->pending_indices[i];
@@ -286,23 +302,19 @@ void merkle_lazy_flush(epoch_state_t *state,
                    all_entries, all_counts, displs, leaf_entry_type, comm);
 
     // 4. Build full leaf array (each rank does this independently)
-    uint8_t *full_leaves = calloc(total_chunks, 32);
+    //    Pre-fill with null sentinel, then overwrite with actual hashes
+    uint8_t null_sentinel[32];
+    compute_null_sentinel(alg, null_sentinel);
+
+    uint8_t *full_leaves = malloc(total_chunks * 32);
+    for (int i = 0; i < total_chunks; i++) {
+        memcpy(&full_leaves[i * 32], null_sentinel, 32);
+    }
+
+    // Overwrite only positions with actual written chunks
     for (int i = 0; i < total_pending; i++) {
         memcpy(&full_leaves[all_entries[i].idx * 32],
                all_entries[i].hash, 32);
-    }
-
-    // Fill gaps with null sentinel (for sparse datasets)
-    uint8_t null_sentinel[32];
-    compute_null_sentinel(alg, null_sentinel);
-    for (int i = 0; i < total_chunks; i++) {
-        int is_zero = 1;
-        for (int j = 0; j < 32; j++) {
-            if (full_leaves[i * 32 + j] != 0) { is_zero = 0; break; }
-        }
-        if (is_zero) {
-            memcpy(&full_leaves[i * 32], null_sentinel, 32);
-        }
     }
 
     // 5. Build tree (replicated on all ranks for consistency check)
