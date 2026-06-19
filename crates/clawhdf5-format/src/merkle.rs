@@ -2776,4 +2776,72 @@ mod tests {
         // Size constants
         assert_eq!(MERKLE_ATTR_SIZE, 97);
     }
+
+    /// Verify that `from_chunks_parallel` and `from_chunks` produce identical roots.
+    ///
+    /// Tests with a 1,024-chunk synthetic dataset on at least 4 rayon threads.
+    #[test]
+    #[cfg(all(feature = "parallel", feature = "blake3"))]
+    fn test_parallel_build_correctness() {
+        use rayon::ThreadPoolBuilder;
+
+        // Ensure at least 4 threads
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("failed to create thread pool");
+
+        pool.install(|| {
+            // Create 1024 synthetic chunks with varying sizes
+            let chunks: Vec<Vec<u8>> = (0..1024)
+                .map(|i| {
+                    // Vary chunk size from 64 to 1024 bytes
+                    let size = 64 + (i % 16) * 64;
+                    let mut chunk = vec![0u8; size];
+                    // Fill with predictable but varying pattern
+                    for (j, byte) in chunk.iter_mut().enumerate() {
+                        *byte = ((i * 31 + j * 17) % 256) as u8;
+                    }
+                    chunk
+                })
+                .collect();
+
+            let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+
+            // Test all three hash algorithms
+            for alg in [HashAlg::Sha256, HashAlg::Blake3, HashAlg::K12] {
+                // Build sequentially
+                let tree_seq = MerkleTree::from_chunks(&refs, alg);
+
+                // Build in parallel
+                let tree_par = MerkleTree::from_chunks_parallel(&refs, alg);
+
+                // Roots must be identical
+                assert_eq!(
+                    tree_seq.root(),
+                    tree_par.root(),
+                    "Root mismatch for {:?}",
+                    alg
+                );
+
+                // All internal nodes must be identical
+                assert_eq!(
+                    tree_seq.nodes().len(),
+                    tree_par.nodes().len(),
+                    "Node count mismatch for {:?}",
+                    alg
+                );
+
+                for (i, (seq_node, par_node)) in
+                    tree_seq.nodes().iter().zip(tree_par.nodes().iter()).enumerate()
+                {
+                    assert_eq!(
+                        seq_node, par_node,
+                        "Node {} mismatch for {:?}",
+                        i, alg
+                    );
+                }
+            }
+        });
+    }
 }
