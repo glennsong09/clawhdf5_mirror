@@ -46,7 +46,7 @@ fn main() {
     // Chunk sizes to test
     let n_values: Vec<usize> = vec![10_000, 100_000, 1_000_000];
     let chunk_size = 1024; // 1 KB chunks
-    let warmup_iters = 3;
+    let warmup_iters = 5;
     let n_trials = 30;
 
     // Using BLAKE3 as the representative algorithm
