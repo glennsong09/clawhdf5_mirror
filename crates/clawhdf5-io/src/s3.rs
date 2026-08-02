@@ -30,7 +30,7 @@ use clawhdf5_format::object_header::ObjectHeader;
 use clawhdf5_format::signature::find_signature;
 use clawhdf5_format::superblock::Superblock;
 
-use crate::async_read::AsyncHDF5Read;
+use crate::async_read::{AsyncHDF5Error, AsyncHDF5Read};
 
 /// Byte size of one Merkle tree node hash (mirrors
 /// `clawhdf5_format::merkle::HASH_SIZE`, which is `pub(crate)` there).
@@ -96,7 +96,15 @@ impl AsyncHDF5Read for S3Reader {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let end = offset + len as u64 - 1;
+        let end = offset
+            .checked_add(len as u64)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("offset {offset} + len {len} overflows u64"),
+                )
+            })?;
         let resp = self
             .client
             .get_object()
@@ -181,7 +189,7 @@ pub async fn resolve_companion_layout<R: AsyncHDF5Read>(
     reader: &R,
     dataset_name: &str,
     prefetch_len: u64,
-) -> io::Result<ContiguousLayout> {
+) -> Result<ContiguousLayout, AsyncHDF5Error> {
     resolve_contiguous_layout(reader, &format!("merkle/{dataset_name}"), prefetch_len).await
 }
 
@@ -195,7 +203,7 @@ pub async fn resolve_contiguous_layout<R: AsyncHDF5Read>(
     reader: &R,
     path: &str,
     prefetch_len: u64,
-) -> io::Result<ContiguousLayout> {
+) -> Result<ContiguousLayout, AsyncHDF5Error> {
     let prefix = reader.read_at(0, prefetch_len as usize).await?;
     parse_contiguous_layout(&prefix, path)
 }
@@ -208,56 +216,59 @@ pub async fn resolve_contiguous_layout<R: AsyncHDF5Read>(
 /// same object (e.g. the P2.5 harness resolving both `merkle/{name}` and
 /// the primary dataset) can fetch the metadata prefix once and resolve both
 /// from it, instead of paying for the prefix range-GET twice.
-pub fn parse_contiguous_layout(prefix: &[u8], path: &str) -> io::Result<ContiguousLayout> {
-    let sig_offset = find_signature(prefix)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let sb = Superblock::parse(prefix, sig_offset)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    let addr = resolve_path_any(prefix, &sb, path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let header = ObjectHeader::parse(prefix, addr as usize, sb.offset_size, sb.length_size)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+pub fn parse_contiguous_layout(
+    prefix: &[u8],
+    path: &str,
+) -> Result<ContiguousLayout, AsyncHDF5Error> {
+    let sig_offset = find_signature(prefix)?;
+    let sb = Superblock::parse(prefix, sig_offset)?;
+    let addr = resolve_path_any(prefix, &sb, path)?;
+    let header = ObjectHeader::parse(prefix, addr as usize, sb.offset_size, sb.length_size)?;
 
     let layout_msg = header
         .messages
         .iter()
         .find(|m| m.msg_type == MessageType::DataLayout)
         .ok_or_else(|| {
-            io::Error::new(
+            AsyncHDF5Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("dataset {path:?} object header has no data layout message"),
-            )
+            ))
         })?;
-    let layout = DataLayout::parse(&layout_msg.data, sb.offset_size, sb.length_size)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let layout = DataLayout::parse(&layout_msg.data, sb.offset_size, sb.length_size)?;
 
     match layout {
         DataLayout::Contiguous {
             address: Some(address),
             size,
         } => Ok(ContiguousLayout { address, size }),
-        DataLayout::Contiguous { address: None, .. } => Err(io::Error::new(
+        DataLayout::Contiguous { address: None, .. } => Err(AsyncHDF5Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("dataset {path:?} has an undefined address (never written)"),
-        )),
-        _ => Err(io::Error::new(
+        ))),
+        _ => Err(AsyncHDF5Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "dataset {path:?} is not contiguous (inline or chunked layout is not supported \
                  for range-GET retrieval)"
             ),
-        )),
+        ))),
     }
 }
 
 /// The sibling-node indices (level-order, root = 0) needed to prove
-/// `leaf_idx` up to the root of a tree with `padded_leaf_count` leaves —
-/// pure index arithmetic, ported from
-/// `clawhdf5_format::subset_proof::extract_subset`'s per-leaf walk so it can
-/// run without materializing the full in-memory `MerkleTree`.
-fn proof_sibling_indices(leaf_idx: u64, padded_leaf_count: u64) -> Vec<u64> {
-    let internal_nodes = padded_leaf_count - 1;
+/// `leaf_idx` up to the root of a tree whose internal-node count is
+/// `internal_nodes` (`padded_leaf_count - 1`) — pure index arithmetic,
+/// ported from `clawhdf5_format::subset_proof::extract_subset`'s per-leaf
+/// walk so it can run without materializing the full in-memory `MerkleTree`.
+///
+/// Precondition (upheld by the sole caller, [`fetch_chunk_proof`], which
+/// validates both before computing `internal_nodes`): `leaf_idx` must be
+/// less than the tree's `padded_leaf_count`. This function takes
+/// `internal_nodes` rather than `padded_leaf_count` directly specifically so
+/// that subtraction happens exactly once, at the validated call site,
+/// instead of being re-derived (and re-risking underflow) here too.
+fn proof_sibling_indices(leaf_idx: u64, internal_nodes: u64) -> Vec<u64> {
     let mut indices = Vec::new();
     let mut node_idx = internal_nodes + leaf_idx;
     while node_idx > 0 {
@@ -296,43 +307,103 @@ pub struct FetchedProof {
 /// `clawhdf5_format::subset_proof::ChunkGridParams::total_chunk_count`); the
 /// caller supplies it rather than this function deriving it, because
 /// deriving a trusted chunk count from an untrusted grid is the verifier's
-/// job (see `verify_subset`'s grid-hash check), not the fetcher's.
+/// job (see `verify_subset`'s grid-hash check), not the fetcher's. This
+/// function does, however, validate that `padded_leaf_count`/`leaf_idx` are
+/// internally consistent before using them in any arithmetic — mirroring
+/// `clawhdf5_format::subset_proof`'s `checked_padded_leaf_count` "reject
+/// before compute" shape, rather than trusting a caller-supplied count to be
+/// non-zero and letting `padded_leaf_count - 1` underflow.
+///
+/// # Errors
+///
+/// Returns an [`AsyncHDF5Error::Io`] with [`io::ErrorKind::InvalidInput`] if
+/// `padded_leaf_count == 0` or `leaf_idx >= padded_leaf_count`, or if the
+/// resulting byte-offset arithmetic would overflow `u64` (astronomically
+/// large `padded_leaf_count`); [`io::ErrorKind::InvalidData`] if the proof
+/// span would extend past the companion dataset's recorded size (e.g. a
+/// truncated/corrupted companion object); [`io::ErrorKind::UnexpectedEof`]
+/// on a short read.
 pub async fn fetch_chunk_proof<R: AsyncHDF5Read>(
     reader: &R,
     layout: ContiguousLayout,
     leaf_idx: u64,
     padded_leaf_count: u64,
-) -> io::Result<FetchedProof> {
-    let internal_nodes = padded_leaf_count - 1;
-    let leaf_node_index = internal_nodes + leaf_idx;
+) -> Result<FetchedProof, AsyncHDF5Error> {
+    if padded_leaf_count == 0 {
+        return Err(AsyncHDF5Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "padded_leaf_count must be at least 1",
+        )));
+    }
+    if leaf_idx >= padded_leaf_count {
+        return Err(AsyncHDF5Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "leaf_idx {leaf_idx} is out of range for padded_leaf_count {padded_leaf_count}"
+            ),
+        )));
+    }
+    let overflow_err = || {
+        AsyncHDF5Error::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proof node byte-offset arithmetic overflowed u64 (padded_leaf_count too large)",
+        ))
+    };
 
-    let mut wanted: Vec<u64> = proof_sibling_indices(leaf_idx, padded_leaf_count);
+    // Safe: padded_leaf_count >= 1 was just checked above.
+    let internal_nodes = padded_leaf_count - 1;
+    let leaf_node_index = internal_nodes
+        .checked_add(leaf_idx)
+        .ok_or_else(overflow_err)?;
+
+    let mut wanted: Vec<u64> = proof_sibling_indices(leaf_idx, internal_nodes);
     wanted.push(leaf_node_index);
 
     // `wanted` always has at least `leaf_node_index`, just pushed above.
     let lo = *wanted.iter().min().expect("wanted is non-empty");
     let hi = *wanted.iter().max().expect("wanted is non-empty");
 
-    let span_start = layout.address + lo * NODE_HASH_SIZE as u64;
-    let span_len = ((hi - lo + 1) * NODE_HASH_SIZE as u64) as usize;
-    if span_start + span_len as u64 > layout.address + layout.size {
-        return Err(io::Error::new(
+    let node_hash_size = NODE_HASH_SIZE as u64;
+    let span_start = lo
+        .checked_mul(node_hash_size)
+        .and_then(|v| v.checked_add(layout.address))
+        .ok_or_else(overflow_err)?;
+    let span_node_count = hi
+        .checked_sub(lo)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(overflow_err)?;
+    let span_len_u64 = span_node_count
+        .checked_mul(node_hash_size)
+        .ok_or_else(overflow_err)?;
+    let span_len = usize::try_from(span_len_u64).map_err(|_| overflow_err())?;
+
+    let span_end = span_start
+        .checked_add(span_len_u64)
+        .ok_or_else(overflow_err)?;
+    let layout_end = layout
+        .address
+        .checked_add(layout.size)
+        .ok_or_else(overflow_err)?;
+    if span_end > layout_end {
+        return Err(AsyncHDF5Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "proof node span extends past the companion dataset's recorded size",
-        ));
+        )));
     }
 
     let span = reader.read_at(span_start, span_len).await?;
     if span.len() < span_len {
-        return Err(io::Error::new(
+        return Err(AsyncHDF5Error::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "short read while fetching proof node span",
-        ));
+        )));
     }
 
     let mut nodes = BTreeMap::new();
     for idx in wanted {
-        let rel = ((idx - lo) * NODE_HASH_SIZE as u64) as usize;
+        // Safe: every `idx` in `wanted` is >= `lo` by construction (`lo` is
+        // their min), so this subtraction cannot underflow.
+        let rel = ((idx - lo) * node_hash_size) as usize;
         let mut hash = [0u8; NODE_HASH_SIZE];
         hash.copy_from_slice(&span[rel..rel + NODE_HASH_SIZE]);
         nodes.insert(idx, hash);
@@ -349,6 +420,7 @@ pub async fn fetch_chunk_proof<R: AsyncHDF5Read>(
 mod tests {
     use super::*;
     use crate::async_read::AsyncMemoryReader;
+    use clawhdf5_format::error::FormatError;
     use clawhdf5_format::file_writer::FileWriter as FmtWriter;
     use clawhdf5_format::merkle::{
         HashAlg, MerkleCompanionResult, MerkleTree, write_merkle_companion,
@@ -411,7 +483,10 @@ mod tests {
         let err = resolve_companion_layout(&reader, "does_not_exist", DEFAULT_METADATA_PREFETCH)
             .await
             .expect_err("nonexistent companion dataset should error");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            matches!(err, AsyncHDF5Error::Format(FormatError::PathNotFound(_))),
+            "expected FormatError::PathNotFound, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -447,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_chunk_proof_rejects_out_of_range_span() {
+    async fn fetch_chunk_proof_rejects_leaf_idx_out_of_range() {
         let (file_bytes, tree) = make_test_file_with_companion("sensor_data", 1024);
         let reader = AsyncMemoryReader::new(file_bytes);
         let layout = resolve_companion_layout(&reader, "sensor_data", DEFAULT_METADATA_PREFETCH)
@@ -457,8 +532,60 @@ mod tests {
         let padded_leaf_count = tree.padded_leaf_count() as u64;
         let err = fetch_chunk_proof(&reader, layout, padded_leaf_count, padded_leaf_count)
             .await
-            .expect_err("leaf index beyond padded_leaf_count should error");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            .expect_err("leaf_idx == padded_leaf_count should error");
+        match err {
+            AsyncHDF5Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            other => panic!("expected AsyncHDF5Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    /// Regression test for the underflow this PR fixes: `padded_leaf_count
+    /// - 1` used to run unconditionally, panicking in debug builds (and
+    /// silently wrapping to a bogus, still-"successful" span in release
+    /// builds) when a caller passed `padded_leaf_count == 0` — e.g. an
+    /// empty/zero-chunk dataset. Must now return a clean error instead.
+    #[tokio::test]
+    async fn fetch_chunk_proof_rejects_zero_padded_leaf_count() {
+        let (file_bytes, _tree) = make_test_file_with_companion("sensor_data", 1024);
+        let reader = AsyncMemoryReader::new(file_bytes);
+        let layout = resolve_companion_layout(&reader, "sensor_data", DEFAULT_METADATA_PREFETCH)
+            .await
+            .unwrap();
+
+        let err = fetch_chunk_proof(&reader, layout, 0, 0)
+            .await
+            .expect_err("padded_leaf_count == 0 should error, not underflow");
+        match err {
+            AsyncHDF5Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            other => panic!("expected AsyncHDF5Error::Io(InvalidInput), got {other:?}"),
+        }
+    }
+
+    /// Distinct from the two validation-rejection tests above: this exercises
+    /// the *data-consistency* check (recorded companion size too small for
+    /// an otherwise-valid, in-range request), which a corrupted or truncated
+    /// companion object could trigger even with well-formed
+    /// `leaf_idx`/`padded_leaf_count` inputs.
+    #[tokio::test]
+    async fn fetch_chunk_proof_rejects_truncated_companion_size() {
+        let (file_bytes, tree) = make_test_file_with_companion("sensor_data", 1024);
+        let reader = AsyncMemoryReader::new(file_bytes);
+        let layout = resolve_companion_layout(&reader, "sensor_data", DEFAULT_METADATA_PREFETCH)
+            .await
+            .unwrap();
+        let truncated = ContiguousLayout {
+            address: layout.address,
+            size: 10, // far smaller than any real proof span needs
+        };
+
+        let padded_leaf_count = tree.padded_leaf_count() as u64;
+        let err = fetch_chunk_proof(&reader, truncated, 500, padded_leaf_count)
+            .await
+            .expect_err("truncated companion size should error");
+        match err {
+            AsyncHDF5Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("expected AsyncHDF5Error::Io(InvalidData), got {other:?}"),
+        }
     }
 
     #[test]
@@ -466,7 +593,7 @@ mod tests {
         // 8-leaf tree: internal_nodes = 7, leaf 0 -> node 7.
         // Siblings walked: 7's sibling 8, then (3-1)/2... verify against
         // the same arithmetic MerkleTree::proof() uses.
-        let siblings = proof_sibling_indices(0, 8);
+        let siblings = proof_sibling_indices(0, 7);
         assert_eq!(siblings.len(), 3); // log2(8) = 3 levels
     }
 }
