@@ -34,10 +34,13 @@
 //!                                 for 1 TB-scale behavior" — e.g. set this
 //!                                 to "1024,8192" for the real run; the
 //!                                 64 MB default is a fast smoke test.
-//!   CLAW_CLOUD_EVAL_CHUNK_BYTES  (default: "4096") Merkle leaf chunk size
+//!   CLAW_CLOUD_EVAL_CHUNK_BYTES  (default: "4096") Merkle leaf chunk size;
+//!                                 must be > 0 (n_chunks = dataset_size /
+//!                                 chunk_bytes)
 //!   CLAW_CLOUD_EVAL_TRIALS       (default: "30") per the statistical
 //!                                 protocol (S2-D2-Yr2 §"Statistical
-//!                                 Protocol": min. 30 trials, 5 warmup)
+//!                                 Protocol": min. 30 trials, 5 warmup);
+//!                                 must be > 0
 //!   CLAW_CLOUD_EVAL_WARMUP       (default: "5")
 //!
 //! Usage:
