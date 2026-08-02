@@ -125,7 +125,20 @@ mod run {
         (file_bytes, tree)
     }
 
-    fn write_header(w: &mut impl IoWrite, bucket: &str, region_pair: &str) -> std::io::Result<()> {
+    /// Writes the header comment + column header. `region_pairs` and
+    /// `dataset_sizes_gb` should cover every row that will end up in the
+    /// file below (preserved rows from prior runs *and* this run's new
+    /// rows) — S2-D2-Yr2 §7.5 asks the header to "record the S3 bucket
+    /// name, region pairs [plural], and file sizes," and a header derived
+    /// from only the current run would silently go stale (misrepresenting
+    /// what the file actually contains) the moment a second region pair or
+    /// size gets merged in by a later run.
+    fn write_header(
+        w: &mut impl IoWrite,
+        bucket: &str,
+        region_pairs: &[String],
+        dataset_sizes_gb: &[String],
+    ) -> std::io::Result<()> {
         let date = std::process::Command::new("date")
             .arg("+%Y-%m-%dT%H:%M:%SZ")
             .output()
@@ -134,7 +147,9 @@ mod run {
             .unwrap_or_default();
         writeln!(
             w,
-            "# bucket={bucket} region_pair={region_pair} date={}",
+            "# bucket={bucket} region_pairs={} dataset_sizes_gb={} date={}",
+            region_pairs.join("|"),
+            dataset_sizes_gb.join("|"),
             date.trim()
         )?;
         writeln!(
@@ -167,6 +182,14 @@ mod run {
             .map(|r| (r.region_pair.clone(), format!("{:.6}", r.dataset_size_gb)))
             .collect();
 
+        // Accumulated across every row that will actually end up in the
+        // file (preserved + new), so the header comment written below
+        // never describes less than what's really in the file.
+        let mut all_region_pairs: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut all_sizes_gb: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
         let mut kept_lines: Vec<String> = Vec::new();
         if csv_path.exists() {
             let existing = std::fs::read_to_string(csv_path)?;
@@ -182,13 +205,27 @@ mod run {
                 let row_region_pair = fields.next().unwrap_or("");
                 let key = (row_region_pair.to_string(), size_gb.to_string());
                 if !refreshed_keys.contains(&key) {
+                    all_region_pairs.insert(row_region_pair.to_string());
+                    all_sizes_gb.insert(size_gb.to_string());
                     kept_lines.push(line.to_string());
                 }
             }
         }
+        for r in new_rows {
+            all_region_pairs.insert(r.region_pair.clone());
+            all_sizes_gb.insert(format!("{:.6}", r.dataset_size_gb));
+        }
+        // Fall back to the current run's region_pair if, for whatever
+        // reason, no rows end up in the file at all — keeps the header
+        // non-misleading rather than empty.
+        if all_region_pairs.is_empty() {
+            all_region_pairs.insert(region_pair.to_string());
+        }
+        let region_pairs: Vec<String> = all_region_pairs.into_iter().collect();
+        let dataset_sizes_gb: Vec<String> = all_sizes_gb.into_iter().collect();
 
         let mut f = std::fs::File::create(csv_path)?;
-        write_header(&mut f, bucket, region_pair)?;
+        write_header(&mut f, bucket, &region_pairs, &dataset_sizes_gb)?;
         for line in &kept_lines {
             writeln!(f, "{line}")?;
         }
