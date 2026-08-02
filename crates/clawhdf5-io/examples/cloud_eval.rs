@@ -29,11 +29,17 @@
 //!                                 its own network position, so the label is
 //!                                 the operator's responsibility.
 //!   CLAW_CLOUD_EVAL_SIZES_MB     (default: "64") comma-separated dataset
-//!                                 sizes to upload and measure, in MB. P2.5
-//!                                 step 2 wants "1 GB and a larger surrogate
-//!                                 for 1 TB-scale behavior" — e.g. set this
-//!                                 to "1024,8192" for the real run; the
-//!                                 64 MB default is a fast smoke test.
+//!                                 sizes to upload and measure, in MB. Must
+//!                                 stay under 5120 (5 GiB) per entry —
+//!                                 `s3::upload` is a single PutObject, and
+//!                                 S3 hard-caps that at 5 GiB; genuinely
+//!                                 larger surrogates need multipart upload,
+//!                                 which this harness doesn't implement.
+//!                                 P2.5 step 2 wants "1 GB and a larger
+//!                                 surrogate for 1 TB-scale behavior" — e.g.
+//!                                 set this to "1024,4096" for the real
+//!                                 run; the 64 MB default is a fast smoke
+//!                                 test.
 //!   CLAW_CLOUD_EVAL_CHUNK_BYTES  (default: "4096") Merkle leaf chunk size;
 //!                                 must be > 0 (n_chunks = dataset_size /
 //!                                 chunk_bytes)
@@ -256,12 +262,23 @@ mod run {
             "CLAW_CLOUD_EVAL_REGION_PAIR",
             &format!("{aws_region}_to_{aws_region}"),
         );
+        // 5 GiB, not 5 * 1000^3 — matches S3's actual single-PutObject limit
+        // (s3::upload doesn't implement multipart upload; see its doc comment).
+        const MAX_SINGLE_PUT_MB: usize = 5 * 1024;
         let sizes_mb: Vec<usize> = env_or("CLAW_CLOUD_EVAL_SIZES_MB", "64")
             .split(',')
             .map(|s| {
-                s.trim()
+                let mb: usize = s
+                    .trim()
                     .parse()
-                    .expect("CLAW_CLOUD_EVAL_SIZES_MB must be a comma list of integers")
+                    .expect("CLAW_CLOUD_EVAL_SIZES_MB must be a comma list of integers");
+                assert!(
+                    mb < MAX_SINGLE_PUT_MB,
+                    "CLAW_CLOUD_EVAL_SIZES_MB entry {mb} MB exceeds S3's 5 GiB single-PutObject \
+                     limit ({MAX_SINGLE_PUT_MB} MB) — s3::upload doesn't implement multipart \
+                     upload, so this would fail at the upload step, not just run slow"
+                );
+                mb
             })
             .collect();
         let chunk_bytes = env_usize("CLAW_CLOUD_EVAL_CHUNK_BYTES", 4096);
