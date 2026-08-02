@@ -58,7 +58,9 @@ fn main() {
 #[cfg(feature = "s3")]
 mod run {
     use clawhdf5_format::file_writer::FileWriter as FmtWriter;
-    use clawhdf5_format::merkle::{HashAlg, MerkleTree, write_merkle_companion};
+    use clawhdf5_format::merkle::{
+        HashAlg, INLINE_CHUNK_THRESHOLD, MerkleCompanionResult, MerkleTree, write_merkle_companion,
+    };
     use clawhdf5_io::async_read::AsyncHDF5Read;
     use clawhdf5_io::s3::{self, S3Location, S3Reader};
     use std::io::Write as IoWrite;
@@ -105,8 +107,16 @@ mod run {
         let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
 
         let mut fw = FmtWriter::new();
-        write_merkle_companion(&mut fw, DATASET_NAME, &tree)
-            .expect("write_merkle_companion should succeed for a non-inline chunk count");
+        let result = write_merkle_companion(&mut fw, DATASET_NAME, &tree)
+            .expect("write_merkle_companion should succeed");
+        assert!(
+            matches!(result, MerkleCompanionResult::Dataset { .. }),
+            "n_chunks={n_chunks} is at or below INLINE_CHUNK_THRESHOLD ({INLINE_CHUNK_THRESHOLD}), \
+             so the companion tree was written inline into the attribute instead of as a separate \
+             /merkle/{{name}} dataset this harness's S3 range-GET path requires — increase \
+             CLAW_CLOUD_EVAL_SIZES_MB or lower CLAW_CLOUD_EVAL_CHUNK_BYTES so n_chunks exceeds \
+             {INLINE_CHUNK_THRESHOLD}"
+        );
         let ds = fw.create_dataset(DATASET_NAME);
         let all_data: Vec<u8> = chunks.into_iter().flatten().collect();
         ds.with_u8_data(&all_data);
