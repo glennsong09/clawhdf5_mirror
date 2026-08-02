@@ -257,8 +257,16 @@ mod run {
                 let _ = s3::fetch_chunk_proof(&reader, layout, 0, padded).await?;
             }
 
+            // Spread sampled leaf indices evenly across the whole tree rather
+            // than clustering near index 0: with `trials` << `n_chunks`,
+            // `trial % n_chunks` degenerates to just `trial`, so every trial
+            // would probe nearly-adjacent leaves (and nearly-identical proof
+            // spans) instead of the varied tree positions a valid benchmark
+            // needs to sample.
+            let leaf_stride = (n_chunks / trials).max(1);
+
             for trial in 1..=trials {
-                let leaf_idx = (trial % n_chunks) as u64;
+                let leaf_idx = (((trial - 1) * leaf_stride) % n_chunks) as u64;
                 let padded_leaf_count = tree.padded_leaf_count() as u64;
 
                 // ── merkle_range_get: first-chunk proof latency + bytes ──
@@ -339,9 +347,30 @@ mod run {
                     trial,
                 });
 
-                // ── full_redownload baseline: whole-object GetObject ──
+                // ── full_redownload baseline: whole-object GetObject + rehash ──
+                // Without Merkle proofs, there's no cheap way to check "just
+                // one chunk" — verifying anything at all requires downloading
+                // the whole object AND rehashing every chunk to rebuild the
+                // root, so this baseline's cost (unlike merkle_range_get's)
+                // is identical whether the caller wanted to check one chunk
+                // or the whole dataset. Both timings below include that
+                // rehash, not just the download — comparing raw download time
+                // against merkle_range_get's fully-verified latency would
+                // understate this baseline's real cost.
                 let t0 = Instant::now();
                 let whole_object = reader.read_at(0, object_len as usize).await?;
+                let data_start = data_layout.address as usize;
+                let data_end = data_start + data_layout.size as usize;
+                let rebuilt: Vec<&[u8]> = whole_object[data_start..data_end]
+                    .chunks(chunk_bytes)
+                    .collect();
+                let rebuilt_tree = MerkleTree::from_chunks(&rebuilt, HashAlg::Blake3);
+                assert_eq!(
+                    rebuilt_tree.root(),
+                    tree.root(),
+                    "full_redownload: rebuilt root from downloaded data does not match the \
+                     locally-known root"
+                );
                 let whole_object_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 all_rows.push(Row {
                     method: "full_redownload",
