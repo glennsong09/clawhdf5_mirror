@@ -82,11 +82,20 @@ mod run {
         std::env::var(name).unwrap_or_else(|_| default.to_string())
     }
 
+    /// Unset -> `default`. Set but unparseable -> a clear panic naming the
+    /// variable and the bad value, matching `CLAW_CLOUD_EVAL_SIZES_MB`'s
+    /// `.expect(...)` pattern below — silently falling back to `default` on
+    /// a typo'd value (e.g. `CLAW_CLOUD_EVAL_TRIALS=3O`, letter O) would
+    /// otherwise burn real S3 requests under a configuration the operator
+    /// didn't actually set.
     fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+        match std::env::var(name) {
+            Err(_) => default,
+            Ok(v) => v
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {v:?}")),
+        }
     }
 
     /// Build an in-memory HDF5 file with `n_chunks` chunks of `chunk_bytes`
@@ -253,7 +262,17 @@ mod run {
             })
             .collect();
         let chunk_bytes = env_usize("CLAW_CLOUD_EVAL_CHUNK_BYTES", 4096);
+        assert!(
+            chunk_bytes > 0,
+            "CLAW_CLOUD_EVAL_CHUNK_BYTES must be greater than 0 (n_chunks is computed as \
+             dataset_size / chunk_bytes)"
+        );
         let trials = env_usize("CLAW_CLOUD_EVAL_TRIALS", 30);
+        assert!(
+            trials > 0,
+            "CLAW_CLOUD_EVAL_TRIALS must be greater than 0 (the statistical protocol needs at \
+             least one trial; leaf-index sampling divides by it)"
+        );
         let warmup = env_usize("CLAW_CLOUD_EVAL_WARMUP", 5);
 
         println!("P2.5: Cloud / WAN evaluation (RQ6, §7.6)");
