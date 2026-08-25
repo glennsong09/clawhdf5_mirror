@@ -125,3 +125,7 @@ required-features = ["merkle"]
 [[example]]
 name = "gen_contiguous_subset_vectors"
 required-features = ["merkle"]
+
+[[bench]]
+name = "subset_proof_geometry_bench"
+harness = false

@@ -15,7 +15,7 @@
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 
 #[cfg(feature = "std")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::merkle::{GRID_PREFIX, HASH_SIZE, HashAlg, MerkleError, MerkleTree, constant_time_eq};
 use crate::selection::Selection;
@@ -457,6 +457,68 @@ pub enum LeafOrder {
     RowMajor,
     /// Z-order curve via bit-interleaving of per-axis chunk coordinates.
     Morton,
+    /// Hilbert curve via Skilling's transform. Better locality constants than
+    /// Morton -- provably minimal bounding-box dilation for rectangular
+    /// queries -- at the cost of a more involved coordinate transform.
+    Hilbert,
+}
+
+/// How `extract_subset` builds the witness set (RQ6, second factor).
+///
+/// Both constructions authenticate the same delivered chunks against the same
+/// signed root; they differ only in how much of the tree is put on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ProofConstruction {
+    /// Union the sibling path of every delivered leaf, deduplicating shared
+    /// internal nodes. Simple, and the historical behaviour of this crate --
+    /// but it transmits interior nodes the verifier could have recomputed
+    /// from the delivered leaves.
+    #[default]
+    NaiveDedup,
+    /// Transmit only the *canonical* witness set: a sibling is sent iff it is
+    /// not itself derivable from the delivered leaves. Every node that the
+    /// verifier can rebuild bottom-up is omitted, so for a solid hyperslab the
+    /// witnesses collapse onto the boundary of the covered region rather than
+    /// scaling with its volume.
+    CanonicalPruned,
+}
+
+/// Level-order indices of the siblings a canonically pruned proof must carry.
+///
+/// Walks the tree bottom-up from the delivered leaves. At each level the set of
+/// *known* nodes is whatever the verifier can already compute; a sibling is
+/// added to the wire set only when it is absent from that set, and every parent
+/// of a known node becomes known at the next level. The result is exactly the
+/// frontier of the covered subtree.
+fn pruned_sibling_indices(padded_count: usize, leaf_indices: &[usize]) -> BTreeSet<usize> {
+    let internal_nodes = padded_count - 1;
+    let mut known: BTreeSet<usize> = leaf_indices
+        .iter()
+        .map(|&l| internal_nodes + l)
+        .collect();
+    let mut transmit: BTreeSet<usize> = BTreeSet::new();
+
+    // A balanced tree over `padded_count` leaves is `log2(padded_count)` levels
+    // deep; the bound makes the loop total even if `known` were ever malformed.
+    let max_levels = usize::BITS as usize;
+    for _ in 0..max_levels {
+        if known.is_empty() || (known.len() == 1 && known.contains(&0)) {
+            break;
+        }
+        let mut next = BTreeSet::new();
+        for &node in &known {
+            if node == 0 {
+                continue;
+            }
+            let sibling = if node % 2 == 1 { node + 1 } else { node - 1 };
+            if !known.contains(&sibling) {
+                transmit.insert(sibling);
+            }
+            next.insert((node - 1) / 2);
+        }
+        known = next;
+    }
+    transmit
 }
 
 /// A delivered chunk paired with its claimed leaf index, as supplied by the
@@ -510,6 +572,77 @@ pub fn morton_index(coords: &[u64]) -> u64 {
     result
 }
 
+/// Map `coords` onto a Hilbert-curve index over a `2^bits`-per-axis cube,
+/// via Skilling's `AxesToTranspose` transform followed by bit interleaving.
+///
+/// Like [`morton_index`] this is quadrant-recursive, so every aligned `2^k`
+/// range of the resulting indices is an axis-aligned rectangle -- the property
+/// that makes a flat Merkle tree over these leaves a Merkle k-d tree. Unlike
+/// Morton it also keeps successive indices spatially adjacent, which is what
+/// tightens the bounding-box dilation.
+///
+/// Coordinates must satisfy `coord < 2^bits` on every axis, and
+/// `bits * coords.len()` must not exceed 64; both hold for any chunk grid the
+/// padded-leaf-count check admits.
+#[must_use]
+pub fn hilbert_index(coords: &[u64], bits: u32) -> u64 {
+    let n = coords.len();
+    if n == 0 || bits == 0 {
+        return 0;
+    }
+    let mut x: Vec<u64> = coords.to_vec();
+    let m = 1u64 << (bits - 1);
+
+    // Inverse undo: walk the quadrant hierarchy from the top, reflecting and
+    // exchanging axes so each sub-cube inherits the parent's orientation.
+    let mut q = m;
+    while q > 1 {
+        let p = q - 1;
+        for i in 0..n {
+            if x[i] & q != 0 {
+                x[0] ^= p;
+            } else {
+                let t = (x[0] ^ x[i]) & p;
+                x[0] ^= t;
+                x[i] ^= t;
+            }
+        }
+        q >>= 1;
+    }
+
+    // Gray encode.
+    for i in 1..n {
+        x[i] ^= x[i - 1];
+    }
+    let mut t = 0u64;
+    let mut q = m;
+    while q > 1 {
+        if x[n - 1] & q != 0 {
+            t ^= q - 1;
+        }
+        q >>= 1;
+    }
+    for v in x.iter_mut() {
+        *v ^= t;
+    }
+
+    // Interleave the transpose, most significant bit plane first.
+    let mut h = 0u64;
+    for bit in (0..bits).rev() {
+        for v in &x {
+            h = (h << 1) | ((v >> bit) & 1);
+        }
+    }
+    h
+}
+
+/// Bits per axis needed to embed `n_per_dim` in a cube, for [`hilbert_index`].
+fn hilbert_bits(n_per_dim: &[u64]) -> u32 {
+    let max_extent = n_per_dim.iter().copied().max().unwrap_or(1).max(1);
+    // ceil(log2(max_extent)), at least 1.
+    (u64::BITS - (max_extent - 1).leading_zeros()).max(1)
+}
+
 fn row_major_index(coord: &[u64], n_per_dim: &[u64]) -> u64 {
     let mut idx = 0u64;
     for d in 0..coord.len() {
@@ -519,10 +652,21 @@ fn row_major_index(coord: &[u64], n_per_dim: &[u64]) -> u64 {
     idx
 }
 
+/// Leaf index that chunk coordinate `coord` occupies under `order`.
+///
+/// Public because anyone *building* a tree has to place chunks at the same
+/// positions [`extract_subset`] will look for them; getting this wrong yields
+/// a tree that verifies against itself and against nothing else.
+#[must_use]
+pub fn leaf_index_for_coord(coord: &[u64], n_per_dim: &[u64], order: LeafOrder) -> u64 {
+    coord_to_leaf_index(coord, n_per_dim, order)
+}
+
 fn coord_to_leaf_index(coord: &[u64], n_per_dim: &[u64], order: LeafOrder) -> u64 {
     match order {
         LeafOrder::RowMajor => row_major_index(coord, n_per_dim),
         LeafOrder::Morton => morton_index(coord),
+        LeafOrder::Hilbert => hilbert_index(coord, hilbert_bits(n_per_dim)),
     }
 }
 
@@ -727,6 +871,26 @@ pub fn extract_subset(
     sel: &Selection,
     order: LeafOrder,
 ) -> Result<SubsetProof, MerkleError> {
+    extract_subset_with(tree, grid, sel, order, ProofConstruction::NaiveDedup)
+}
+
+/// [`extract_subset`], with the witness construction chosen explicitly.
+///
+/// [`ProofConstruction::CanonicalPruned`] omits every node the verifier can
+/// recompute from the delivered leaves, so it must be paired with
+/// [`verify_subset_with`] under the same setting: the naive verifier walks each
+/// leaf to the root independently and would find those nodes missing.
+///
+/// # Errors
+///
+/// As [`extract_subset`].
+pub fn extract_subset_with(
+    tree: &MerkleTree,
+    grid: &ChunkGridParams,
+    sel: &Selection,
+    order: LeafOrder,
+    construction: ProofConstruction,
+) -> Result<SubsetProof, MerkleError> {
     let chunk_indices = compute_expected_chunk_indices(grid, sel, order)?;
 
     let padded_count = tree.padded_leaf_count();
@@ -741,21 +905,35 @@ pub fn extract_subset(
             .leaf_hash(leaf_idx)
             .ok_or(MerkleError::HyperslabOutOfBounds { idx: leaf_idx })?;
         leaf_hashes.push(*hash);
+    }
 
-        let mut node_idx = internal_nodes + leaf_idx;
-        while node_idx > 0 {
-            let sibling_idx = if node_idx % 2 == 1 {
-                node_idx + 1
-            } else {
-                node_idx - 1
-            };
-            let sibling_hash = *nodes
-                .get(sibling_idx)
-                .ok_or(MerkleError::HyperslabOutOfBounds { idx: leaf_idx })?;
-            proof_nodes
-                .entry(sibling_idx as u64)
-                .or_insert(sibling_hash);
-            node_idx = (node_idx - 1) / 2;
+    match construction {
+        ProofConstruction::NaiveDedup => {
+            for &leaf_idx in &chunk_indices {
+                let mut node_idx = internal_nodes + leaf_idx;
+                while node_idx > 0 {
+                    let sibling_idx = if node_idx % 2 == 1 {
+                        node_idx + 1
+                    } else {
+                        node_idx - 1
+                    };
+                    let sibling_hash = *nodes
+                        .get(sibling_idx)
+                        .ok_or(MerkleError::HyperslabOutOfBounds { idx: leaf_idx })?;
+                    proof_nodes
+                        .entry(sibling_idx as u64)
+                        .or_insert(sibling_hash);
+                    node_idx = (node_idx - 1) / 2;
+                }
+            }
+        }
+        ProofConstruction::CanonicalPruned => {
+            for sibling_idx in pruned_sibling_indices(padded_count, &chunk_indices) {
+                let sibling_hash = *nodes
+                    .get(sibling_idx)
+                    .ok_or(MerkleError::HyperslabOutOfBounds { idx: sibling_idx })?;
+                proof_nodes.insert(sibling_idx as u64, sibling_hash);
+            }
         }
     }
 
@@ -880,6 +1058,41 @@ pub fn verify_subset(
     sel: &Selection,
     order: LeafOrder,
 ) -> Result<bool, MerkleError> {
+    verify_subset_with(
+        root,
+        alg,
+        chunks,
+        proof,
+        expected_grid,
+        trusted_grid_hash,
+        sel,
+        order,
+        ProofConstruction::NaiveDedup,
+    )
+}
+
+/// [`verify_subset`], with the witness construction stated by the verifier.
+///
+/// `construction` is a *caller* parameter, not a field read off the untrusted
+/// proof: the verifier decides which wire format it is willing to accept, the
+/// same way it supplies `order` and `expected_grid`.
+///
+/// # Errors
+///
+/// As [`verify_subset`]. A proof built under the other construction fails with
+/// [`MerkleError::CompanionTampered`], since the node it needs is absent.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_subset_with(
+    root: &[u8; HASH_SIZE],
+    alg: HashAlg,
+    chunks: &[ChunkData<'_>],
+    proof: &SubsetProof,
+    expected_grid: &ChunkGridParams,
+    trusted_grid_hash: &[u8; HASH_SIZE],
+    sel: &Selection,
+    order: LeafOrder,
+    construction: ProofConstruction,
+) -> Result<bool, MerkleError> {
     // Authenticate expected_grid's parameters against the caller's
     // cryptographically-anchored grid hash *before* trusting anything else
     // about expected_grid. Recomputing from expected_grid's own fields
@@ -935,6 +1148,10 @@ pub fn verify_subset(
     let padded_count = checked_padded_leaf_count(expected_grid)?;
     let internal_nodes = padded_count - 1;
 
+    // Every delivered chunk must hash to the leaf the proof claims for it.
+    // Shared by both constructions, and done before any tree walk so a bad
+    // payload is rejected without touching the witness set.
+    let mut computed_leaves: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(chunks.len());
     for (i, (chunk, &leaf_idx)) in chunks.iter().zip(proof.chunk_indices.iter()).enumerate() {
         let computed_leaf_hash = alg.hash_leaf(chunk.data);
         if !constant_time_eq(&computed_leaf_hash, &proof.leaf_hashes[i]) {
@@ -942,6 +1159,65 @@ pub fn verify_subset(
                 chunk_idx: leaf_idx,
             });
         }
+        computed_leaves.push(computed_leaf_hash);
+    }
+
+    if construction == ProofConstruction::CanonicalPruned {
+        // Rebuild the covered subtree bottom-up. A node is available either
+        // because it was recomputed at the previous level or because the proof
+        // carried it; anything the delivered leaves imply is never on the wire.
+        let mut known: BTreeMap<usize, [u8; HASH_SIZE]> = proof
+            .chunk_indices
+            .iter()
+            .zip(computed_leaves.iter())
+            .map(|(&leaf_idx, &h)| (internal_nodes + leaf_idx, h))
+            .collect();
+
+        let max_levels = usize::BITS as usize;
+        let mut levels = 0usize;
+        while !(known.len() == 1 && known.contains_key(&0)) {
+            if known.is_empty() || levels >= max_levels {
+                return Err(MerkleError::CompanionTampered);
+            }
+            levels += 1;
+            let mut next: BTreeMap<usize, [u8; HASH_SIZE]> = BTreeMap::new();
+            for (&node, &hash) in &known {
+                if node == 0 {
+                    // A root alongside deeper nodes is a malformed index set.
+                    return Err(MerkleError::CompanionTampered);
+                }
+                let parent = (node - 1) / 2;
+                if next.contains_key(&parent) {
+                    continue;
+                }
+                let sibling = if node % 2 == 1 { node + 1 } else { node - 1 };
+                let sibling_hash = known
+                    .get(&sibling)
+                    .copied()
+                    .or_else(|| proof.proof_nodes.get(&(sibling as u64)).copied())
+                    .ok_or(MerkleError::CompanionTampered)?;
+                let combined = if node % 2 == 1 {
+                    alg.hash_pair(&hash, &sibling_hash)
+                } else {
+                    alg.hash_pair(&sibling_hash, &hash)
+                };
+                next.insert(parent, combined);
+            }
+            known = next;
+        }
+
+        let computed_root = known.get(&0).ok_or(MerkleError::CompanionTampered)?;
+        if !constant_time_eq(computed_root, root) {
+            return Err(MerkleError::HashMismatch {
+                chunk_idx: proof.chunk_indices.first().copied().unwrap_or(0),
+            });
+        }
+        return Ok(true);
+    }
+
+    for (i, (chunk, &leaf_idx)) in chunks.iter().zip(proof.chunk_indices.iter()).enumerate() {
+        let computed_leaf_hash = computed_leaves[i];
+        let _ = chunk;
 
         let mut node_idx = internal_nodes + leaf_idx;
         // Guard against overflow in sibling_idx calculation below. In practice,
@@ -1202,6 +1478,321 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MerkleError::CompanionTampered));
+    }
+
+    // ---------------------------------------------------------------
+    // Hilbert linearization (RQ6, leaf-ordering factor).
+    // ---------------------------------------------------------------
+
+    /// Every cell of a `2^bits` cube must get a distinct index in
+    /// `0..2^(bits*ndim)` -- a linearization that is not a bijection would
+    /// silently alias two chunks onto one leaf.
+    #[test]
+    fn test_hilbert_is_a_bijection_on_the_cube() {
+        for (ndim, bits) in [(2u32, 3u32), (3, 2), (3, 3)] {
+            let side = 1u64 << bits;
+            let total = side.pow(ndim) as usize;
+            let mut seen = vec![false; total];
+            let mut coord = vec![0u64; ndim as usize];
+            for flat in 0..total {
+                let mut rem = flat as u64;
+                for d in (0..ndim as usize).rev() {
+                    coord[d] = rem % side;
+                    rem /= side;
+                }
+                let h = hilbert_index(&coord, bits) as usize;
+                assert!(h < total, "hilbert index {h} out of range for {ndim}d/{bits}b");
+                assert!(!seen[h], "hilbert index {h} produced twice ({ndim}d/{bits}b)");
+                seen[h] = true;
+            }
+        }
+    }
+
+    /// The defining property: consecutive indices are spatial neighbours.
+    /// Morton does not have this, which is the whole reason to pay for Hilbert.
+    #[test]
+    fn test_hilbert_successive_indices_are_adjacent() {
+        for (ndim, bits) in [(2usize, 3u32), (3, 3)] {
+            let side = 1u64 << bits;
+            let total = side.pow(ndim as u32) as usize;
+            let mut pos_of_index = vec![vec![0u64; ndim]; total];
+            let mut coord = vec![0u64; ndim];
+            for flat in 0..total {
+                let mut rem = flat as u64;
+                for d in (0..ndim).rev() {
+                    coord[d] = rem % side;
+                    rem /= side;
+                }
+                pos_of_index[hilbert_index(&coord, bits) as usize] = coord.clone();
+            }
+            for h in 1..total {
+                let dist: u64 = pos_of_index[h]
+                    .iter()
+                    .zip(pos_of_index[h - 1].iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .sum();
+                assert_eq!(dist, 1, "hilbert step {h} moved {dist} cells ({ndim}d)");
+            }
+        }
+    }
+
+    /// Quadrant-recursiveness: every aligned `2^k` block of Hilbert indices is
+    /// an axis-aligned rectangle. This is the claim that a flat Merkle tree
+    /// over SFC-ordered leaves already *is* a Merkle k-d tree, so it is worth
+    /// testing rather than asserting.
+    #[test]
+    fn test_hilbert_aligned_ranges_are_rectangles() {
+        let (ndim, bits) = (2usize, 3u32);
+        let side = 1u64 << bits;
+        let total = (side.pow(ndim as u32)) as usize;
+        let mut pos_of_index = vec![vec![0u64; ndim]; total];
+        let mut coord = vec![0u64; ndim];
+        for flat in 0..total {
+            let mut rem = flat as u64;
+            for d in (0..ndim).rev() {
+                coord[d] = rem % side;
+                rem /= side;
+            }
+            pos_of_index[hilbert_index(&coord, bits) as usize] = coord.clone();
+        }
+        for k in 1..=(bits as usize * ndim) {
+            let block = 1usize << k;
+            for start in (0..total).step_by(block) {
+                let cells = &pos_of_index[start..start + block];
+                let mut lo = cells[0].clone();
+                let mut hi = cells[0].clone();
+                for c in cells {
+                    for d in 0..ndim {
+                        lo[d] = lo[d].min(c[d]);
+                        hi[d] = hi[d].max(c[d]);
+                    }
+                }
+                let volume: u64 = (0..ndim).map(|d| hi[d] - lo[d] + 1).product();
+                assert_eq!(
+                    volume as usize, block,
+                    "aligned range [{start},{}) is not a rectangle", start + block
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hilbert_round_trips_through_extract_and_verify() {
+        for construction in [ProofConstruction::NaiveDedup, ProofConstruction::CanonicalPruned] {
+            let (tree, grid, payload) = make_2d(8, LeafOrder::Hilbert);
+            let sel = Selection::slice(&[2..6, 2..6]);
+            let proof =
+                extract_subset_with(&tree, &grid, &sel, LeafOrder::Hilbert, construction).unwrap();
+            let delivered = deliver(&proof, &payload);
+            assert!(
+                verify_subset_with(
+                    tree.root(), HashAlg::Blake3, &delivered, &proof, &grid,
+                    &grid.grid_hash, &sel, LeafOrder::Hilbert, construction,
+                )
+                .unwrap(),
+                "hilbert round trip failed under {construction:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Canonical pruning (RQ6, proof-construction factor).
+    // ---------------------------------------------------------------
+
+    /// Build an `n x n` grid of single-element chunks under `order`, returning
+    /// the tree, the grid, and the chunk payload indexed by leaf position.
+    fn make_2d(n: u64, order: LeafOrder) -> (MerkleTree, ChunkGridParams, Vec<Vec<u8>>) {
+        let grid = ChunkGridParams::new(
+            vec![n, n],
+            vec![1, 1],
+            4,
+            LayoutClass::Chunked,
+            HashAlg::Blake3,
+        );
+        let n_per_dim = grid.n_chunks_per_dim();
+        let total = grid.total_chunk_count() as usize;
+        let mut chunk_at_leaf = vec![Vec::new(); total];
+        for y in 0..n_per_dim[0] {
+            for x in 0..n_per_dim[1] {
+                let leaf = coord_to_leaf_index(&[y, x], &n_per_dim, order) as usize;
+                chunk_at_leaf[leaf] = format!("chunk-{y}-{x}").into_bytes();
+            }
+        }
+        let refs: Vec<&[u8]> = chunk_at_leaf.iter().map(Vec::as_slice).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+        (tree, grid, chunk_at_leaf)
+    }
+
+    fn deliver<'a>(proof: &SubsetProof, payload: &'a [Vec<u8>]) -> Vec<ChunkData<'a>> {
+        proof
+            .chunk_indices
+            .iter()
+            .map(|&idx| ChunkData {
+                index: idx,
+                data: &payload[idx],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_pruned_proof_round_trips_both_orders() {
+        for order in [LeafOrder::RowMajor, LeafOrder::Morton] {
+            let (tree, grid, payload) = make_2d(8, order);
+            for sel in [
+                Selection::slice(&[2..6, 2..6]), // solid block
+                Selection::slice(&[0..8, 3..4]), // thin slab
+                Selection::All,
+            ] {
+                let proof =
+                    extract_subset_with(&tree, &grid, &sel, order, ProofConstruction::CanonicalPruned)
+                        .unwrap();
+                let delivered = deliver(&proof, &payload);
+                let ok = verify_subset_with(
+                    tree.root(),
+                    HashAlg::Blake3,
+                    &delivered,
+                    &proof,
+                    &grid,
+                    &grid.grid_hash,
+                    &sel,
+                    order,
+                    ProofConstruction::CanonicalPruned,
+                )
+                .unwrap();
+                assert!(ok, "pruned round trip failed for {order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pruned_is_a_subset_of_naive_and_strictly_smaller_on_a_block() {
+        let (tree, grid, _payload) = make_2d(8, LeafOrder::Morton);
+        let sel = Selection::slice(&[2..6, 2..6]);
+        let naive = extract_subset_with(
+            &tree, &grid, &sel, LeafOrder::Morton, ProofConstruction::NaiveDedup,
+        )
+        .unwrap();
+        let pruned = extract_subset_with(
+            &tree, &grid, &sel, LeafOrder::Morton, ProofConstruction::CanonicalPruned,
+        )
+        .unwrap();
+
+        for idx in pruned.proof_nodes.keys() {
+            assert!(
+                naive.proof_nodes.contains_key(idx),
+                "pruned node {idx} is not in the naive witness set"
+            );
+        }
+        assert!(
+            pruned.proof_nodes.len() < naive.proof_nodes.len(),
+            "pruning saved nothing on a solid block: {} vs {}",
+            pruned.proof_nodes.len(),
+            naive.proof_nodes.len()
+        );
+    }
+
+    #[test]
+    fn test_whole_dataset_needs_no_witnesses_when_pruned() {
+        // Every leaf is delivered, so the verifier can rebuild the entire tree
+        // and nothing needs to go on the wire.
+        let (tree, grid, payload) = make_2d(8, LeafOrder::RowMajor);
+        let sel = Selection::All;
+        let proof = extract_subset_with(
+            &tree, &grid, &sel, LeafOrder::RowMajor, ProofConstruction::CanonicalPruned,
+        )
+        .unwrap();
+        assert!(
+            proof.proof_nodes.is_empty(),
+            "whole-dataset pruned proof carried {} nodes",
+            proof.proof_nodes.len()
+        );
+        let delivered = deliver(&proof, &payload);
+        assert!(
+            verify_subset_with(
+                tree.root(), HashAlg::Blake3, &delivered, &proof, &grid,
+                &grid.grid_hash, &sel, LeafOrder::RowMajor,
+                ProofConstruction::CanonicalPruned,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pruned_proof_rejected_by_naive_verifier() {
+        // The two wire formats are not interchangeable in the lossy direction:
+        // the naive verifier walks each leaf independently and needs siblings
+        // the pruned prover deliberately omitted.
+        let (tree, grid, payload) = make_2d(8, LeafOrder::Morton);
+        let sel = Selection::slice(&[2..6, 2..6]);
+        let pruned = extract_subset_with(
+            &tree, &grid, &sel, LeafOrder::Morton, ProofConstruction::CanonicalPruned,
+        )
+        .unwrap();
+        let delivered = deliver(&pruned, &payload);
+        assert!(
+            verify_subset(
+                tree.root(), HashAlg::Blake3, &delivered, &pruned, &grid,
+                &grid.grid_hash, &sel, LeafOrder::Morton,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_pruned_verifier_rejects_tampering() {
+        let (tree, grid, payload) = make_2d(8, LeafOrder::Morton);
+        let sel = Selection::slice(&[2..6, 2..6]);
+        let proof = extract_subset_with(
+            &tree, &grid, &sel, LeafOrder::Morton, ProofConstruction::CanonicalPruned,
+        )
+        .unwrap();
+
+        // (a) a flipped payload byte
+        let mut bad_payload = payload.clone();
+        let victim = proof.chunk_indices[0];
+        bad_payload[victim][0] ^= 0xff;
+        let delivered = deliver(&proof, &bad_payload);
+        assert!(
+            verify_subset_with(
+                tree.root(), HashAlg::Blake3, &delivered, &proof, &grid,
+                &grid.grid_hash, &sel, LeafOrder::Morton,
+                ProofConstruction::CanonicalPruned,
+            )
+            .is_err(),
+            "tampered chunk accepted"
+        );
+
+        // (b) a flipped witness node
+        let mut bad_proof = proof.clone();
+        if let Some((&k, _)) = bad_proof.proof_nodes.iter().next() {
+            let h = bad_proof.proof_nodes.get_mut(&k).unwrap();
+            h[0] ^= 0xff;
+        }
+        let delivered = deliver(&proof, &payload);
+        assert!(
+            verify_subset_with(
+                tree.root(), HashAlg::Blake3, &delivered, &bad_proof, &grid,
+                &grid.grid_hash, &sel, LeafOrder::Morton,
+                ProofConstruction::CanonicalPruned,
+            )
+            .is_err(),
+            "tampered witness accepted"
+        );
+
+        // (c) a dropped chunk -- the completeness case R5b exists for
+        let mut short = proof.clone();
+        short.chunk_indices.pop();
+        short.leaf_hashes.pop();
+        let delivered = deliver(&short, &payload);
+        assert!(
+            verify_subset_with(
+                tree.root(), HashAlg::Blake3, &delivered, &short, &grid,
+                &grid.grid_hash, &sel, LeafOrder::Morton,
+                ProofConstruction::CanonicalPruned,
+            )
+            .is_err(),
+            "incomplete delivery accepted"
+        );
     }
 
     #[test]
