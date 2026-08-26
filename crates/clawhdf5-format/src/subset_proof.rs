@@ -490,7 +490,7 @@ pub enum ProofConstruction {
 /// added to the wire set only when it is absent from that set, and every parent
 /// of a known node becomes known at the next level. The result is exactly the
 /// frontier of the covered subtree.
-fn pruned_sibling_indices(padded_count: usize, leaf_indices: &[usize]) -> BTreeSet<usize> {
+pub(crate) fn pruned_sibling_indices(padded_count: usize, leaf_indices: &[usize]) -> BTreeSet<usize> {
     let internal_nodes = padded_count - 1;
     let mut known: BTreeSet<usize> = leaf_indices
         .iter()
@@ -797,7 +797,7 @@ fn chunk_coords_for_selection(
     }
 }
 
-fn coverage_cert(
+pub(crate) fn coverage_cert(
     sorted_indices: &[usize],
     grid_hash: &[u8; HASH_SIZE],
     alg: HashAlg,
@@ -833,7 +833,7 @@ fn coverage_cert(
 /// malformed grid fails fast (zero chunk-shape, mismatched axis counts) or
 /// bounded (`MerkleError::TreeTooDeep`) instead of dividing by zero or
 /// sweeping an astronomical chunk count.
-fn compute_expected_chunk_indices(
+pub(crate) fn compute_expected_chunk_indices(
     grid: &ChunkGridParams,
     sel: &Selection,
     order: LeafOrder,
@@ -976,7 +976,7 @@ const MAX_TREE_DEPTH: usize = 40;
 /// mismatched axis counts, zero chunk-shape entries, chunk counts that don't
 /// fit in a `usize` or whose next power of two would overflow, and grids
 /// whose implied depth exceeds [`MAX_TREE_DEPTH`].
-fn checked_padded_leaf_count(grid: &ChunkGridParams) -> Result<usize, MerkleError> {
+pub(crate) fn checked_padded_leaf_count(grid: &ChunkGridParams) -> Result<usize, MerkleError> {
     validate_grid_shape(grid)?;
     let mut total: u64 = 1;
     for (&d, &c) in grid.dims.iter().zip(grid.chunk_shape.iter()) {

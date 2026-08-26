@@ -110,6 +110,16 @@ pub enum MerkleError {
         /// Reason for the failure.
         reason: InvalidAttrReason,
     },
+    /// An overlay-mesh coarsening level is not usable for this tree: it
+    /// would place the coarse leaf above the root (`level` exceeds the
+    /// tree's height). Caller misuse rather than adversarial input --
+    /// `level` is verifier-supplied trusted knowledge, like `LeafOrder`.
+    MeshLevelTooCoarse {
+        /// The requested coarsening level (group size `2^level`).
+        level: u32,
+        /// The tree's height in levels above the native leaf row.
+        height: u32,
+    },
     /// A subset proof's claimed chunk-index set does not match the set
     /// independently recomputed from the verifier's own requested selection
     /// and chunk grid (see `subset_proof::verify_subset`). This means the
@@ -249,6 +259,14 @@ impl core::fmt::Display for MerkleError {
                     "subset proof's chunk set does not match the requested selection"
                 )
             }
+            MerkleError::MeshLevelTooCoarse { level, height } => {
+                write!(
+                    f,
+                    "overlay-mesh level {} exceeds the tree height {} \
+                     (a coarse leaf cannot sit above the root)",
+                    level, height
+                )
+            }
             MerkleError::VersionRollback {
                 observed,
                 highest_seen,
@@ -365,6 +383,9 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
         MerkleError::SelectionMismatch => VerifyResponse::Halt,
+        // Caller misuse (a level above the root), not a detected tamper; the
+        // verification still did not complete, so it fails closed like the rest.
+        MerkleError::MeshLevelTooCoarse { .. } => VerifyResponse::Halt,
         // T4 rollback is adversarial: fail closed.
         MerkleError::VersionRollback { .. } => VerifyResponse::Halt,
         // A corrupt or unreadable provenance journal cannot be trusted for

@@ -105,6 +105,8 @@ pub mod selection;
 pub mod shared_message;
 pub mod signature;
 #[cfg(feature = "merkle")]
+pub mod overlay_mesh;
+#[cfg(feature = "merkle")]
 pub mod subset_proof;
 pub mod superblock;
 pub mod symbol_table;
