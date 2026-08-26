@@ -34,6 +34,7 @@
 //! real chunked byte blob) and runs per-dataset like T1a/T2a/T2b.
 
 mod attacks;
+mod control;
 mod fixture;
 mod report;
 
@@ -224,6 +225,16 @@ fn main() {
 
     report::print_table(&results);
 
+    // Untampered control arm (RQ5's false-positive column). The attack matrix
+    // alone cannot distinguish a working verifier from one that rejects
+    // everything; these runs are what give it a denominator.
+    println!("\n=== Untampered controls ===\n");
+    let mut controls: Vec<control::ControlResult> = Vec::new();
+    controls.extend(control::run_dataset_controls(&noaa_ds));
+    controls.extend(control::run_dataset_controls(&eqsim_ds));
+    controls.push(control::c6_signed_root());
+    control::print_table(&controls);
+
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("attack-results");
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         eprintln!("warning: could not create {}: {e}", out_dir.display());
@@ -232,6 +243,25 @@ fn main() {
     match std::fs::write(&csv_path, report::to_csv(&results)) {
         Ok(()) => println!("\nWrote {}", csv_path.display()),
         Err(e) => eprintln!("warning: could not write {}: {e}", csv_path.display()),
+    }
+
+    let control_path = out_dir.join("control.csv");
+    match std::fs::write(&control_path, control::to_csv(&controls)) {
+        Ok(()) => println!("Wrote {}", control_path.display()),
+        Err(e) => eprintln!("warning: could not write {}: {e}", control_path.display()),
+    }
+
+    // A false positive is a correctness bug, not a documented tradeoff: an
+    // untampered file that fails verification breaks the format for honest
+    // readers. Fail the run rather than recording it in a CSV nobody reads.
+    let fp: usize = controls.iter().map(|r| r.false_positives).sum();
+    let control_trials: usize = controls.iter().map(|r| r.trials).sum();
+    if fp > 0 {
+        eprintln!(
+            "\nERROR: {fp}/{control_trials} untampered verification(s) were rejected. \
+             A false positive is a correctness bug, not a disclosed limitation."
+        );
+        std::process::exit(1);
     }
 
     let undetected = results.iter().filter(|r| !r.detected).count();
@@ -251,4 +281,5 @@ fn main() {
         results.len() - undetected,
         undetected
     );
+    println!("{control_trials} untampered verification(s), 0 false positives.");
 }

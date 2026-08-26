@@ -53,7 +53,7 @@ use clawhdf5_format::verification_grid::LayoutClass;
 use crate::fixture::HarnessDataset;
 use crate::report::AttackResult;
 
-fn companion_hash(nodes: &[u8]) -> [u8; 32] {
+pub(crate) fn companion_hash(nodes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(nodes);
     hasher.finalize().into()
@@ -61,7 +61,7 @@ fn companion_hash(nodes: &[u8]) -> [u8; 32] {
 
 /// Build the Merkle-protection state (tree, packed attribute, companion node
 /// array) over a [`HarnessDataset`]'s current chunk boundaries.
-fn build_merkle_state(ds: &HarnessDataset) -> (MerkleTree, MerkleAttr, Vec<u8>) {
+pub(crate) fn build_merkle_state(ds: &HarnessDataset) -> (MerkleTree, MerkleAttr, Vec<u8>) {
     let chunks = ds.all_chunks(&ds.bytes);
     let tree = MerkleTree::from_chunks(&chunks, HashAlg::Blake3);
     let mut nodes = Vec::with_capacity(tree.nodes().len() * 32);
@@ -72,7 +72,7 @@ fn build_merkle_state(ds: &HarnessDataset) -> (MerkleTree, MerkleAttr, Vec<u8>) 
     (tree, attr, nodes)
 }
 
-fn dataset_view<'a>(
+pub(crate) fn dataset_view<'a>(
     attr: MerkleAttr,
     nodes: Vec<u8>,
     ds: &'a HarnessDataset,
@@ -514,7 +514,7 @@ pub fn t6a_root_attribute_stripped(ds: &HarnessDataset) -> AttackResult {
 /// attacks exercise `verify_subset`'s soundness properties (omission,
 /// substitution, wrong-coverage detection) generically over "chunk `i` of
 /// N," not real 2D hyperslab coverage against the satellite image's true grid.
-fn whole_dataset_grid(ds: &HarnessDataset) -> ChunkGridParams {
+pub(crate) fn whole_dataset_grid(ds: &HarnessDataset) -> ChunkGridParams {
     ChunkGridParams::new(
         vec![ds.chunk_count() as u64],
         vec![1],
@@ -528,7 +528,7 @@ fn whole_dataset_grid(ds: &HarnessDataset) -> ChunkGridParams {
 /// `Selection::slice(&[range])`, which clippy flags as an ambiguous
 /// single-element array-of-`Range`) since every selection this harness needs
 /// is over the flat, one-dimensional chunk grid.
-fn range_1d(range: std::ops::Range<u64>) -> Selection {
+pub(crate) fn range_1d(range: std::ops::Range<u64>) -> Selection {
     Selection::Hyperslab {
         start: vec![range.start],
         stride: vec![1],
@@ -1101,7 +1101,7 @@ pub fn t6b_algorithm_downgrade() -> AttackResult {
 /// canonical payload binding `(root, companion_hash, alg, version, timestamp)`.
 /// This is the injection point that wires `clawhdf5-sign` into
 /// `clawhdf5-format`'s `verify_signed_root` without a dependency cycle.
-struct HybridRootVerifier {
+pub(crate) struct HybridRootVerifier {
     sig: clawhdf5_sign::HybridSignature,
     ed_pub: clawhdf5_sign::VerifyingKey,
     ml_pub: clawhdf5_sign::mldsa::MlDsaVerifyingKey,
@@ -1127,7 +1127,7 @@ impl SignedRootVerifier for HybridRootVerifier {
 /// Sign the honest `(root, companion_hash, alg, version, timestamp)` with fresh
 /// hybrid keys and return a verifier bound to that signature. Shared by the
 /// signed-dataset attacks (T6c, T1f).
-fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) -> HybridRootVerifier {
+pub(crate) fn sign_honest_root(attr: &MerkleAttr, version: u64, timestamp: u64) -> HybridRootVerifier {
     use clawhdf5_sign::{SigningKey, canonical_payload, mldsa::MlDsaSigningKey, sign_root};
     let ed_key = SigningKey::generate();
     let ml_key = MlDsaSigningKey::generate();

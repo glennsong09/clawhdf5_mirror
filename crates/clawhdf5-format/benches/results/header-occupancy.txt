@@ -1,0 +1,29 @@
+=== Object-header occupancy of a signature attribute ===
+
+Baseline dataset header, no signature attribute: 134 bytes
+
+scheme                      sig+pk B      header B     delta B
+--------------------------------------------------------------
+(none)                             -           134           0
+Ed25519                           96           289         155
+Ed25519 + ML-DSA-65             5358          5551        5417
+Ed25519 + SLH-DSA-256s         29824         30017       29883
+
+=== chunk0 size-field transitions ===
+  payload    75 B: header jumps 266 -> 268 (size field widened)
+
+=== u16 message-size field: behaviour at and past 64 KiB ===
+  payload   65000 B -> message   65054 B, size field declares   65054 B  [ok]
+  payload   65480 B -> message   65534 B, size field declares   65534 B  [ok]
+  payload   65600 B -> message   65654 B, size field declares     118 B  [TRUNCATED]
+  payload  200000 B -> message  200054 B, size field declares    3446 B  [TRUNCATED]
+
+=== continuation blocks ===
+  200 KB attribute -> 200195 byte header, OCHK continuation block present: false
+  ObjectHeaderWriter::serialize() has no continuation path: every message
+  is emitted into chunk 0 regardless of total size.
+
+NOTE: these are measurements of this workspace's writer, not of the HDF5
+C library. The 64 KB object-header limit and the compact-to-dense attribute
+transition are library behaviours this writer does not model, so the paper
+must not cite these figures as HDF5 limits.
