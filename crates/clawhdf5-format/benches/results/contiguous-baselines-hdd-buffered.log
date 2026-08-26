@@ -1,0 +1,6 @@
+==> hdd/buffered bao baseline
+sequential read bandwidth: 179 MB/s (buffered)
+class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
+### cache eviction check (timing): warm 0.013s, after evict 1.509s, ratio 112.74x
+### cache eviction verified
+reusing outboard at /home/brtnfld_2025/brtnfld/p28c-hdd/clawbench-contiguous-1000cubed.obao

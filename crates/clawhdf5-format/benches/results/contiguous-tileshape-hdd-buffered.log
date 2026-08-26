@@ -121,3 +121,5 @@ class=hdd B=512 (default logical block size) stripe=-x- readahead=- o_direct=0
 ### cache eviction unverified (no RPC counter)
 building tree for 64x64x64...
   built in 21.5s
+  64x64x64/plane: 111.0s for 30 trials
+    137s
