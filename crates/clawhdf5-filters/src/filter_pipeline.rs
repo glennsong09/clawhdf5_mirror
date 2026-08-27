@@ -155,14 +155,24 @@ pub struct FilteredChunk {
 /// tag, and version counter of chunk k' in place of chunk k, because the index
 /// is baked into the hash.
 ///
-/// TODO(P2.4): this leaf formula is distinct from `clawhdf5-format`'s
-/// `HashAlg::hash_leaf` (`H(0x00 || chunk)`), which is what `verify_chunk` /
-/// `verify_dataset` recompute — so a `Dataset` built from an encrypted file's
-/// companion nodes cannot currently be verified by the format-side functions.
-/// The attack harness (P2.4) needs a version-aware verification path in
-/// `clawhdf5-format` (or a leaf-formula parameter on `Dataset`) before T4
-/// selective-rollback detection works end-to-end rather than only at the
+/// This leaf formula is distinct from `clawhdf5-format`'s
+/// `HashAlg::hash_leaf` (`H(0x00 || chunk)`). That divergence used to mean a
+/// `Dataset` built from an encrypted file's companion nodes could not be
+/// verified by the format-side functions at all; it is now resolved by
+/// `clawhdf5_format::merkle::LeafFormat`, which records the preimage as a
+/// property of the dataset in `MerkleAttr` (bound into its integrity hash, so
+/// it cannot be downgraded) and dispatches `verify_chunk` / `verify_dataset`
+/// through `Dataset::leaf_hash_for`.
+///
+/// A writer using this function must therefore tag its attribute with
+/// `MerkleAttr::with_leaf_format(LeafFormat::Bound)` and supply the per-chunk
+/// counters via `Dataset::with_versions`, which is what makes T4
+/// selective-rollback detection work end-to-end rather than only at the
 /// leaf-hash level (see `crash_vs_tamper_matrix.rs`, scenario e).
+///
+/// `plaintext_leaf_matches_format_crate_bound_preimage` and
+/// `encrypted_leaf_matches_format_crate_bound_preimage` in this module's tests
+/// pin the two implementations together byte for byte.
 ///
 /// # Arguments
 ///
@@ -838,6 +848,44 @@ mod tests {
         assert!(
             !pipeline.verify_leaf_hash(1, &chunk_0.ciphertext, 1, &chunk_0.leaf_hash),
             "position-swapping attack should be detected"
+        );
+    }
+
+    // ===== Cross-crate leaf-preimage agreement (closes TODO(P2.4)) =====
+
+    /// The writer here and the verifier in `clawhdf5-format` must produce
+    /// byte-identical leaves, or a dataset written through this pipeline
+    /// fails every verification. This test is the contract between them: if
+    /// either preimage is edited without the other, it breaks here rather
+    /// than in the field.
+    #[test]
+    fn plaintext_leaf_matches_format_crate_bound_preimage() {
+        use clawhdf5_format::merkle::{HashAlg, hash_chunk_bound};
+
+        for (idx, data, version) in [
+            (0u64, &b""[..], 0u64),
+            (1, &b"a"[..], 1),
+            (7, &b"chunk seven contents"[..], 42),
+            (u64::from(u32::MAX), &b"high index"[..], u64::MAX),
+        ] {
+            assert_eq!(
+                compute_leaf_hash_plaintext(idx, data, version),
+                hash_chunk_bound(idx, data, version, HashAlg::Blake3),
+                "leaf preimage diverged at idx={idx}, version={version}"
+            );
+        }
+    }
+
+    /// The AEAD form is the same preimage over `ciphertext || tag`, so it must
+    /// agree with the format crate too when handed those bytes.
+    #[test]
+    fn encrypted_leaf_matches_format_crate_bound_preimage() {
+        use clawhdf5_format::merkle::{HashAlg, hash_chunk_bound};
+
+        let ct_and_tag = b"ciphertext-bytes-then-16-byte-tag";
+        assert_eq!(
+            compute_leaf_hash(3, ct_and_tag, 11),
+            hash_chunk_bound(3, ct_and_tag, 11, HashAlg::Blake3),
         );
     }
 }

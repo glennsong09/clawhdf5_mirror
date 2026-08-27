@@ -110,6 +110,11 @@ pub enum MerkleError {
         /// Reason for the failure.
         reason: InvalidAttrReason,
     },
+    /// The dataset's `MerkleAttr` declares [`LeafFormat::Bound`], whose leaf
+    /// preimage binds a per-chunk version counter, but the [`Dataset`] was
+    /// built without `chunk_versions`. Verification fails closed rather than
+    /// silently substituting zeros, which would accept a rolled-back chunk.
+    MissingChunkVersions,
     /// An overlay-mesh coarsening level is not usable for this tree: it
     /// would place the coarse leaf above the root (`level` exceeds the
     /// tree's height). Caller misuse rather than adversarial input --
@@ -179,12 +184,14 @@ pub enum MerkleError {
 /// Reasons why a merkle attribute is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidAttrReason {
-    /// Attribute size is not 129 bytes.
+    /// Attribute size is not [`MERKLE_ATTR_SIZE`] bytes.
     WrongSize,
     /// Unknown algorithm identifier.
     UnknownAlgorithm,
     /// Integrity hash does not match.
     IntegrityMismatch,
+    /// Unknown leaf-format identifier (see [`LeafFormat`]).
+    UnknownLeafFormat,
 }
 
 /// Result of companion data verification.
@@ -246,12 +253,19 @@ impl core::fmt::Display for MerkleError {
             MerkleError::InvalidAttribute { reason } => {
                 let msg = match reason {
                     InvalidAttrReason::WrongSize => {
-                        "attribute size is not valid (expected 129 bytes for v0)"
+                        "attribute size is not valid (expected 130 bytes for v1)"
                     }
                     InvalidAttrReason::UnknownAlgorithm => "unknown algorithm identifier",
                     InvalidAttrReason::IntegrityMismatch => "integrity hash mismatch",
+                    InvalidAttrReason::UnknownLeafFormat => "unknown leaf-format identifier",
                 };
                 write!(f, "Invalid merkle attribute: {}", msg)
+            }
+            MerkleError::MissingChunkVersions => {
+                write!(
+                    f,
+                    "dataset declares LeafFormat::Bound but no chunk_versions were supplied"
+                )
             }
             MerkleError::SelectionMismatch => {
                 write!(
@@ -383,6 +397,10 @@ pub fn default_response(e: &MerkleError) -> VerifyResponse {
         MerkleError::NoncePending => VerifyResponse::Halt,
         MerkleError::InvalidAttribute { .. } => VerifyResponse::Halt,
         MerkleError::SelectionMismatch => VerifyResponse::Halt,
+        // The dataset says its leaves bind a version counter and the caller
+        // did not supply one: we cannot recompute the committed preimage at
+        // all, so this is an incomplete verification, not a passed one.
+        MerkleError::MissingChunkVersions => VerifyResponse::Halt,
         // Caller misuse (a level above the root), not a detected tamper; the
         // verification still did not complete, so it fails closed like the rest.
         MerkleError::MeshLevelTooCoarse { .. } => VerifyResponse::Halt,
@@ -540,6 +558,29 @@ impl HashAlg {
     /// Uses incremental hashing APIs to avoid memory allocation.
     ///
     /// This is equivalent to calling [`hash_chunk`] with the same algorithm.
+    ///
+    /// # This is the *unbound* content hash, not the dataset leaf preimage
+    ///
+    /// This computes `H(0x00 || data)`. The normative dataset leaf preimage
+    /// (S2-D2-Yr2 §5.9) additionally binds the chunk index and the version
+    /// counter under explicit length prefixes:
+    ///
+    /// ```text
+    /// H(0x00 || len(k) || k || len(Chunk_k) || Chunk_k || v_k)
+    /// ```
+    ///
+    /// and is implemented by `clawhdf5_filters::compute_leaf_hash_plaintext`
+    /// / `compute_leaf_hash`. Binding `k` is what prevents **position-swapping**
+    /// (relocating chunk k' bytes to position k) and the length prefixes are
+    /// what prevent **boundary-shifting** once compression makes chunk lengths
+    /// vary.
+    ///
+    /// Callers hashing a chunk *of a dataset* on a verification path must use
+    /// the bound form; this method is correct only where there is no dataset
+    /// context to bind (hash benchmarks, core-tree unit tests). See the
+    /// `TODO(P2.4)` on `clawhdf5_filters::compute_leaf_hash` — `verify_chunk`
+    /// / `verify_dataset` still recompute this unbound form, so they cannot
+    /// yet verify a dataset written through the bound filter pipeline.
     #[inline]
     pub fn hash_leaf(&self, data: &[u8]) -> [u8; HASH_SIZE] {
         hash_chunk(data, *self)
@@ -586,11 +627,23 @@ impl HashAlg {
     }
 }
 
-/// Compute the leaf hash for a raw chunk of data.
+/// Compute the content hash for a raw chunk of data: `H(0x00 || data)`.
 ///
-/// This is the primary entry point for hashing chunk data with the correct
-/// domain separation prefix (`0x00`). Uses incremental hashing APIs to avoid
-/// memory allocation for large chunks.
+/// Applies the leaf domain-separation prefix (`0x00`) and uses incremental
+/// hashing APIs to avoid memory allocation for large chunks.
+///
+/// # This is the content-hash primitive, not the dataset leaf preimage
+///
+/// The normative dataset leaf preimage (S2-D2-Yr2 §5.9) binds the chunk index
+/// and version counter under explicit length prefixes —
+/// `H(0x00 || len(k) || k || len(Chunk_k) || Chunk_k || v_k)` — and lives in
+/// `clawhdf5_filters::compute_leaf_hash_plaintext`. This function deliberately
+/// omits that binding because it has no dataset context to bind: it exists for
+/// the RQ4 hash benchmarks and the hand-checked core-tree unit tests.
+///
+/// An unbound leaf reaching a verification path silently reintroduces the
+/// position-swapping attack that binding `k` exists to prevent. See
+/// [`HashAlg::hash_leaf`] for the full note.
 ///
 /// # BLAKE3 API Note
 ///
@@ -615,6 +668,115 @@ pub fn hash_chunk(data: &[u8], alg: HashAlg) -> [u8; HASH_SIZE] {
         HashAlg::Blake3 => hash_chunk_blake3(data),
         HashAlg::K12 => hash_chunk_k12(data),
     }
+}
+
+/// Which leaf preimage a dataset's Merkle leaves were built with.
+///
+/// This is a property of the dataset, carried in [`MerkleAttr`] and bound into
+/// its integrity hash, because a verifier that recomputes the wrong preimage
+/// accepts data the writer never committed to. Compiling the choice into each
+/// crate instead is what produced the `TODO(P2.4)` split between
+/// `clawhdf5-format` (unbound) and `clawhdf5-filters` (bound), where a dataset
+/// written through the filter pipeline could not be verified here at all.
+///
+/// Binding it into `compute_integrity` alongside the algorithm id is what makes
+/// the choice non-negotiable: an attacker who flips a [`Bound`](Self::Bound)
+/// dataset's byte to [`Content`](Self::Content) — stripping index and version
+/// binding, and with it position-swapping and rollback detection — invalidates
+/// the integrity hash and the attribute is rejected on unpack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeafFormat {
+    /// `H(0x00 || data)` — the bare content hash, with no dataset context.
+    ///
+    /// Correct only where there is nothing to bind: the RQ4 hash benchmarks
+    /// and the hand-checked core-tree unit tests. A dataset committed under
+    /// this format has **no** position-swapping or rollback protection: chunk
+    /// k' bytes relocated to position k verify cleanly, as does a chunk rolled
+    /// back to an earlier version.
+    Content,
+    /// `H(0x00 || len(k) || k || len(data) || data || v_k)` — the normative
+    /// dataset leaf preimage of S2-D2-Yr2 §5.9.
+    ///
+    /// Binding `k` prevents position-swapping; binding `v_k` makes a
+    /// selective rollback break the path to the signed root (threat T4); the
+    /// fixed-width big-endian length prefixes prevent boundary-shifting once
+    /// compression makes chunk lengths vary. Matches
+    /// `clawhdf5_filters::compute_leaf_hash_plaintext` byte for byte.
+    Bound,
+}
+
+/// Leaf-format identifier bytes for the merkle_root attribute.
+const LEAF_FMT_ID_CONTENT: u8 = 0x00;
+const LEAF_FMT_ID_BOUND: u8 = 0x01;
+
+impl LeafFormat {
+    /// Get the leaf-format identifier byte for serialization.
+    #[inline]
+    #[must_use]
+    pub const fn to_id(self) -> u8 {
+        match self {
+            LeafFormat::Content => LEAF_FMT_ID_CONTENT,
+            LeafFormat::Bound => LEAF_FMT_ID_BOUND,
+        }
+    }
+
+    /// Parse a leaf-format identifier byte.
+    ///
+    /// Returns `None` for unknown ids, so an attribute written by a newer
+    /// version fails closed rather than being silently read as `Content`.
+    #[inline]
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            LEAF_FMT_ID_CONTENT => Some(LeafFormat::Content),
+            LEAF_FMT_ID_BOUND => Some(LeafFormat::Bound),
+            _ => None,
+        }
+    }
+
+    /// Whether this format's preimage binds a per-chunk version counter, and
+    /// therefore requires `chunk_versions` on the [`Dataset`] to verify.
+    #[inline]
+    #[must_use]
+    pub const fn needs_versions(self) -> bool {
+        matches!(self, LeafFormat::Bound)
+    }
+}
+
+/// Compute the bound dataset leaf hash for a chunk.
+///
+/// ```text
+/// H(0x00 || len(k) || k || len(data) || data || v_k)
+/// ```
+///
+/// All length fields are fixed-width big-endian `u32`; `k` and `v_k` are
+/// little-endian `u64`. This must stay byte-identical to
+/// `clawhdf5_filters::compute_leaf_hash_plaintext` — the writer there and the
+/// verifier here have to agree or every verification fails.
+///
+/// `data` is the chunk as stored (post-filter): for an encrypted chunk that is
+/// `ciphertext || tag`, which is what makes this the same preimage the AEAD
+/// form of §5.9 specifies.
+#[inline]
+#[must_use]
+pub fn hash_chunk_bound(chunk_idx: u64, data: &[u8], version: u64, alg: HashAlg) -> [u8; HASH_SIZE] {
+    // len(data) is a u32 field; a chunk at or above 4 GiB cannot be encoded.
+    // Saturating here would make two different chunks share a preimage, so
+    // callers must not hand us one -- HDF5 chunks are bounded far below this.
+    debug_assert!(
+        u32::try_from(data.len()).is_ok(),
+        "chunk exceeds the u32 length field of the bound leaf preimage"
+    );
+    let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+
+    let mut buf = Vec::with_capacity(1 + 4 + 8 + 4 + data.len() + 8);
+    buf.push(LEAF_PREFIX); // 0x00
+    buf.extend_from_slice(&8u32.to_be_bytes()); // len(k) = 8
+    buf.extend_from_slice(&chunk_idx.to_le_bytes()); // k
+    buf.extend_from_slice(&data_len.to_be_bytes()); // len(data)
+    buf.extend_from_slice(data); // data
+    buf.extend_from_slice(&version.to_le_bytes()); // v_k
+    alg.hash_raw(&buf)
 }
 
 /// Compute SHA-256 hash of arbitrary data.
@@ -1217,18 +1379,37 @@ const INTEGRITY_PREFIX: u8 = 0x03;
 
 // ---- Attribute format versioning ----
 //
-// Version 0 (implicit): 129 bytes, current format
+// Version 0 (retired): 129 bytes, no leaf-format field
+// Version 1 (implicit, current): 130 bytes, leaf-format byte after the alg byte
 // Future versions may add a version byte prefix
 
-/// Attribute format version 0 (current, 129 bytes with companion and grid hash).
+/// Attribute format version 0 (retired, 129 bytes, no leaf-format field).
+///
+/// A v0 attribute is indistinguishable from a truncated v1 one, so `unpack`
+/// rejects the old length outright rather than inferring
+/// [`LeafFormat::Content`] from it: silently reading a 129-byte blob as
+/// "unbound leaves" is exactly the downgrade the leaf-format byte exists to
+/// prevent. Files written under v0 must be re-committed.
 pub const MERKLE_ATTR_VERSION_0: u8 = 0;
 
-// ---- 129-byte attribute layout offsets ----
+/// Attribute format version 1 (current, 130 bytes: adds the leaf-format byte).
+pub const MERKLE_ATTR_VERSION_1: u8 = 1;
+
+// ---- 130-byte attribute layout offsets ----
 //
-// ┌─────────────────────────────────┬───────┬─────────────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
-// │         Root Hash (32B)         │Alg(1B)│     Integrity Hash (32B)        │   Companion Hash (32B)          │      Grid Hash (32B)            │
-// └─────────────────────────────────┴───────┴─────────────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
-// 0                                32      33                                65                                97                               129
+// ┌─────────────────────────────────┬───────┬───────┬─────────────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+// │         Root Hash (32B)         │Alg(1B)│Leaf(1B)│    Integrity Hash (32B)        │   Companion Hash (32B)          │      Grid Hash (32B)            │
+// └─────────────────────────────────┴───────┴───────┴─────────────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+// 0                                32      33      34                                66                                98                              130
+//
+// The Leaf Format field records which leaf preimage the tree was built with
+// (see `LeafFormat`). Unlike Companion Hash and Grid Hash it IS folded into
+// `compute_integrity`, alongside the algorithm id, because it changes what the
+// root means rather than adding a side-channel check: a verifier that
+// recomputes `H(0x00 || data)` for a tree committed under
+// `LeafFormat::Bound` would drop index and version binding and with them
+// position-swapping and rollback detection. Binding it makes that downgrade
+// invalidate the attribute instead of weakening it silently.
 //
 // The Grid Hash field binds a dataset's chunk-grid parameters (`dims`,
 // `chunk_shape`) into this attribute (see `subset_proof::ChunkGridParams`
@@ -1250,33 +1431,42 @@ const ATTR_ALG_OFFSET: usize = ATTR_ROOT_END; // 32
 /// Size of algorithm identifier field.
 const ATTR_ALG_SIZE: usize = 1;
 
+/// Offset of the leaf-format identifier in packed attribute.
+///
+/// Records which leaf preimage the tree was built with ([`LeafFormat`]);
+/// bound into the integrity hash so it cannot be downgraded.
+const ATTR_LEAF_FMT_OFFSET: usize = ATTR_ALG_OFFSET + ATTR_ALG_SIZE; // 33
+/// Size of the leaf-format identifier field.
+const ATTR_LEAF_FMT_SIZE: usize = 1;
+
 /// Offset of integrity hash in packed attribute.
-const ATTR_INTEGRITY_OFFSET: usize = ATTR_ALG_OFFSET + ATTR_ALG_SIZE; // 33
+const ATTR_INTEGRITY_OFFSET: usize = ATTR_LEAF_FMT_OFFSET + ATTR_LEAF_FMT_SIZE; // 34
 /// Size of integrity hash field.
 const ATTR_INTEGRITY_SIZE: usize = HASH_SIZE;
 /// End offset of integrity hash (exclusive).
-const ATTR_INTEGRITY_END: usize = ATTR_INTEGRITY_OFFSET + ATTR_INTEGRITY_SIZE; // 65
+const ATTR_INTEGRITY_END: usize = ATTR_INTEGRITY_OFFSET + ATTR_INTEGRITY_SIZE; // 66
 
 /// Offset of companion hash in packed attribute.
-const ATTR_COMPANION_OFFSET: usize = ATTR_INTEGRITY_END; // 65
+const ATTR_COMPANION_OFFSET: usize = ATTR_INTEGRITY_END; // 66
 /// Size of companion hash field.
 const ATTR_COMPANION_SIZE: usize = HASH_SIZE;
 /// End offset of companion hash (exclusive).
-const ATTR_COMPANION_END: usize = ATTR_COMPANION_OFFSET + ATTR_COMPANION_SIZE; // 97
+const ATTR_COMPANION_END: usize = ATTR_COMPANION_OFFSET + ATTR_COMPANION_SIZE; // 98
 
 /// Offset of grid hash in packed attribute.
 ///
 /// Binds a dataset's chunk-grid parameters (`dims`, `chunk_shape`) into the
 /// attribute (see `subset_proof::ChunkGridParams`/`compute_grid_hash`). An
 /// all-zero value means "no grid hash bound" (see `MerkleAttr::has_grid_hash`).
-const ATTR_GRID_OFFSET: usize = ATTR_COMPANION_END; // 97
+const ATTR_GRID_OFFSET: usize = ATTR_COMPANION_END; // 98
 /// Size of grid hash field.
 const ATTR_GRID_SIZE: usize = HASH_SIZE;
 /// End offset of grid hash (exclusive).
-const ATTR_GRID_END: usize = ATTR_GRID_OFFSET + ATTR_GRID_SIZE; // 129
+const ATTR_GRID_END: usize = ATTR_GRID_OFFSET + ATTR_GRID_SIZE; // 130
 
-/// Size of the packed merkle_root attribute (root + alg_id + integrity + companion_hash + grid_hash).
-pub const MERKLE_ATTR_SIZE: usize = ATTR_GRID_END; // 129 bytes
+/// Size of the packed merkle_root attribute
+/// (root + alg_id + leaf_format + integrity + companion_hash + grid_hash).
+pub const MERKLE_ATTR_SIZE: usize = ATTR_GRID_END; // 130 bytes
 
 /// Name of the HDF5 attribute storing merkle root information.
 pub const MERKLE_ATTR_NAME: &str = "merkle_root";
@@ -1336,7 +1526,13 @@ pub struct MerkleAttr {
     pub root: [u8; HASH_SIZE],
     /// The hash algorithm used.
     pub algorithm: HashAlg,
-    /// Integrity hash binding root and algorithm.
+    /// Which leaf preimage the tree's leaves were built with.
+    ///
+    /// Bound into [`integrity`](Self::integrity), so it cannot be downgraded
+    /// from [`LeafFormat::Bound`] to [`LeafFormat::Content`] without the
+    /// attribute failing to unpack.
+    pub leaf_format: LeafFormat,
+    /// Integrity hash binding root, algorithm, and leaf format.
     pub integrity: [u8; HASH_SIZE],
     /// SHA-256 hash of the companion/inline nodes data.
     /// All zeros if no companion data (root-only attribute).
@@ -1349,11 +1545,31 @@ pub struct MerkleAttr {
 impl MerkleAttr {
     /// Create a new merkle attribute from a tree without companion or grid data.
     ///
-    /// Computes the integrity hash as `H(0x03 || root || alg_id)`.
+    /// Computes the integrity hash as `H(0x03 || root || alg_id || leaf_fmt)`.
     /// Sets companion_hash and grid_hash to all zeros.
+    ///
+    /// Defaults to [`LeafFormat::Content`], which is correct for a tree built
+    /// from [`hash_chunk`] leaves (benchmarks, core-tree tests). A tree whose
+    /// leaves came from the filter pipeline must use
+    /// [`with_leaf_format`](Self::with_leaf_format) to record
+    /// [`LeafFormat::Bound`], or verification will recompute the wrong
+    /// preimage and reject every chunk.
     #[must_use]
     pub fn from_tree(tree: &MerkleTree) -> Self {
         Self::from_tree_with_companion(tree, [0u8; HASH_SIZE])
+    }
+
+    /// Return this attribute with `leaf_format` set, recomputing the integrity
+    /// hash so the new value is bound.
+    ///
+    /// This is the constructor a writer that produced bound leaves (via
+    /// `clawhdf5_filters::compute_leaf_hash*` or [`hash_chunk_bound`]) must
+    /// use.
+    #[must_use]
+    pub fn with_leaf_format(mut self, leaf_format: LeafFormat) -> Self {
+        self.leaf_format = leaf_format;
+        self.integrity = Self::compute_integrity(&self.root, self.algorithm, leaf_format);
+        self
     }
 
     /// Create a new merkle attribute from a tree with companion data hash.
@@ -1380,11 +1596,13 @@ impl MerkleAttr {
     ) -> Self {
         let root = *tree.root();
         let algorithm = tree.algorithm();
-        let integrity = Self::compute_integrity(&root, algorithm);
+        let leaf_format = LeafFormat::Content;
+        let integrity = Self::compute_integrity(&root, algorithm, leaf_format);
 
         Self {
             root,
             algorithm,
+            leaf_format,
             integrity,
             companion_hash,
             grid_hash,
@@ -1393,39 +1611,49 @@ impl MerkleAttr {
 
     /// Compute the integrity hash.
     ///
-    /// This binds the root hash and algorithm ID together, preventing
-    /// an attacker from changing the algorithm without detection.
-    fn compute_integrity(root: &[u8; HASH_SIZE], alg: HashAlg) -> [u8; HASH_SIZE] {
-        let mut data = [0u8; 1 + HASH_SIZE + 1];
+    /// Binds the root hash, algorithm ID, and leaf format together, preventing
+    /// an attacker from changing either the algorithm or the leaf preimage
+    /// without detection. The leaf format is bound for the same reason the
+    /// algorithm is: both change what the root commits to, so a verifier that
+    /// reads a tampered value re-derives a root the writer never signed.
+    fn compute_integrity(
+        root: &[u8; HASH_SIZE],
+        alg: HashAlg,
+        leaf_format: LeafFormat,
+    ) -> [u8; HASH_SIZE] {
+        let mut data = [0u8; 1 + HASH_SIZE + 2];
         data[0] = INTEGRITY_PREFIX;
         data[1..HASH_SIZE + 1].copy_from_slice(root);
         data[HASH_SIZE + 1] = alg.to_id();
+        data[HASH_SIZE + 2] = leaf_format.to_id();
         alg.hash_raw(&data)
     }
 
-    /// Pack the attribute into a 129-byte binary blob.
+    /// Pack the attribute into a 130-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32][grid_hash:32]`
+    /// Layout: `[root:32][alg:1][leaf_fmt:1][integrity:32][companion_hash:32][grid_hash:32]`
     #[must_use]
     pub fn pack(&self) -> [u8; MERKLE_ATTR_SIZE] {
         let mut buf = [0u8; MERKLE_ATTR_SIZE];
         buf[ATTR_ROOT_OFFSET..ATTR_ROOT_END].copy_from_slice(&self.root);
         buf[ATTR_ALG_OFFSET] = self.algorithm.to_id();
+        buf[ATTR_LEAF_FMT_OFFSET] = self.leaf_format.to_id();
         buf[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END].copy_from_slice(&self.integrity);
         buf[ATTR_COMPANION_OFFSET..ATTR_COMPANION_END].copy_from_slice(&self.companion_hash);
         buf[ATTR_GRID_OFFSET..ATTR_GRID_END].copy_from_slice(&self.grid_hash);
         buf
     }
 
-    /// Unpack from a 129-byte binary blob.
+    /// Unpack from a 130-byte binary blob.
     ///
-    /// Layout: `[root:32][alg:1][integrity:32][companion_hash:32][grid_hash:32]`
+    /// Layout: `[root:32][alg:1][leaf_fmt:1][integrity:32][companion_hash:32][grid_hash:32]`
     ///
     /// # Errors
     ///
     /// Returns `Err` if:
-    /// - The data is not 129 bytes (`WrongSize`)
+    /// - The data is not 130 bytes (`WrongSize`)
     /// - The algorithm ID is unknown (`UnknownAlgorithm`)
+    /// - The leaf-format ID is unknown (`UnknownLeafFormat`)
     /// - The integrity hash does not match (`IntegrityMismatch`)
     pub fn unpack(data: &[u8]) -> Result<Self, MerkleError> {
         if data.len() != MERKLE_ATTR_SIZE {
@@ -1442,6 +1670,12 @@ impl MerkleAttr {
             reason: InvalidAttrReason::UnknownAlgorithm,
         })?;
 
+        let leaf_fmt_id = data[ATTR_LEAF_FMT_OFFSET];
+        let leaf_format =
+            LeafFormat::from_id(leaf_fmt_id).ok_or(MerkleError::InvalidAttribute {
+                reason: InvalidAttrReason::UnknownLeafFormat,
+            })?;
+
         let mut integrity = [0u8; ATTR_INTEGRITY_SIZE];
         integrity.copy_from_slice(&data[ATTR_INTEGRITY_OFFSET..ATTR_INTEGRITY_END]);
 
@@ -1451,8 +1685,10 @@ impl MerkleAttr {
         let mut grid_hash = [0u8; ATTR_GRID_SIZE];
         grid_hash.copy_from_slice(&data[ATTR_GRID_OFFSET..ATTR_GRID_END]);
 
-        // Verify integrity hash
-        let expected_integrity = Self::compute_integrity(&root, algorithm);
+        // Verify integrity hash. This is what makes the leaf-format byte
+        // non-negotiable: flipping Bound -> Content to strip index and version
+        // binding changes the preimage here and the attribute is rejected.
+        let expected_integrity = Self::compute_integrity(&root, algorithm, leaf_format);
         if !constant_time_eq(&integrity, &expected_integrity) {
             return Err(MerkleError::InvalidAttribute {
                 reason: InvalidAttrReason::IntegrityMismatch,
@@ -1462,6 +1698,7 @@ impl MerkleAttr {
         Ok(Self {
             root,
             algorithm,
+            leaf_format,
             integrity,
             companion_hash,
             grid_hash,
@@ -1558,7 +1795,7 @@ impl MerkleAttr {
     /// Get the format version of this attribute.
     #[must_use]
     pub const fn version(&self) -> u8 {
-        MERKLE_ATTR_VERSION_0
+        MERKLE_ATTR_VERSION_1
     }
 }
 
@@ -1752,7 +1989,7 @@ impl<'a> MerkleAttrRef<'a> {
     /// Get the format version.
     #[must_use]
     pub const fn version(&self) -> u8 {
-        MERKLE_ATTR_VERSION_0
+        MERKLE_ATTR_VERSION_1
     }
 
     /// Get a reference to the raw data.
@@ -1789,6 +2026,24 @@ impl<'a> MerkleAttrRef<'a> {
     pub fn algorithm(&self) -> Result<HashAlg, MerkleError> {
         HashAlg::from_id(self.algorithm_id()).ok_or(MerkleError::InvalidAttribute {
             reason: InvalidAttrReason::UnknownAlgorithm,
+        })
+    }
+
+    /// Get the leaf-format identifier byte.
+    #[must_use]
+    pub fn leaf_format_id(&self) -> u8 {
+        self.data[ATTR_LEAF_FMT_OFFSET]
+    }
+
+    /// Get the leaf format the tree's leaves were built with.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the leaf-format ID is unknown, so an attribute from a
+    /// newer writer fails closed rather than being read as unbound.
+    pub fn leaf_format(&self) -> Result<LeafFormat, MerkleError> {
+        LeafFormat::from_id(self.leaf_format_id()).ok_or(MerkleError::InvalidAttribute {
+            reason: InvalidAttrReason::UnknownLeafFormat,
         })
     }
 
@@ -1831,11 +2086,14 @@ impl<'a> MerkleAttrRef<'a> {
 
     /// Verify the integrity hash without fully unpacking.
     ///
-    /// This validates that the root and algorithm haven't been tampered with.
+    /// This validates that the root, algorithm, and leaf format haven't been
+    /// tampered with.
     pub fn verify_integrity(&self) -> Result<(), MerkleError> {
         let algorithm = self.algorithm()?;
-        let expected = MerkleAttr::compute_integrity(&self.root_array(), algorithm);
-        // Safe: integrity() always returns exactly HASH_SIZE bytes for v0
+        let leaf_format = self.leaf_format()?;
+        let expected =
+            MerkleAttr::compute_integrity(&self.root_array(), algorithm, leaf_format);
+        // Safe: integrity() always returns exactly HASH_SIZE bytes for v1
         let integrity_arr: &[u8; HASH_SIZE] =
             self.integrity()
                 .try_into()
@@ -2311,6 +2569,14 @@ pub struct Dataset<'a> {
     pub tree_nodes: Vec<u8>,
     /// References to chunk data for verification. Each slice is one chunk.
     pub chunks: Vec<&'a [u8]>,
+    /// Per-chunk version counters, parallel to `chunks`.
+    ///
+    /// Required when `merkle_attr.leaf_format` is [`LeafFormat::Bound`], whose
+    /// preimage binds `v_k`; verification returns
+    /// [`MerkleError::MissingChunkVersions`] if it is empty in that case rather
+    /// than defaulting to zeros, which would accept a rolled-back chunk.
+    /// Ignored (and conventionally empty) for [`LeafFormat::Content`].
+    pub chunk_versions: Vec<u64>,
 }
 
 impl<'a> Dataset<'a> {
@@ -2326,6 +2592,48 @@ impl<'a> Dataset<'a> {
             merkle_attr,
             tree_nodes: tree_nodes.to_vec(),
             chunks,
+            chunk_versions: Vec::new(),
+        }
+    }
+
+    /// Attach the per-chunk version counters required by
+    /// [`LeafFormat::Bound`].
+    ///
+    /// `versions` must be parallel to `chunks`; a length mismatch is caught at
+    /// verification time rather than here, so that constructing a `Dataset`
+    /// stays infallible.
+    #[must_use]
+    pub fn with_versions(mut self, versions: Vec<u64>) -> Self {
+        self.chunk_versions = versions;
+        self
+    }
+
+    /// The leaf hash this dataset's declared [`LeafFormat`] commits to for
+    /// chunk `idx`.
+    ///
+    /// This is the single place the format dispatch happens, so a verification
+    /// path cannot accidentally recompute the unbound preimage for a bound
+    /// dataset.
+    ///
+    /// # Errors
+    ///
+    /// - [`MerkleError::MissingChunkVersions`] if the format binds `v_k` but
+    ///   no version is available for `idx`.
+    pub fn leaf_hash_for(&self, idx: usize, data: &[u8]) -> Result<[u8; HASH_SIZE], MerkleError> {
+        match self.merkle_attr.leaf_format {
+            LeafFormat::Content => Ok(self.merkle_attr.algorithm.hash_leaf(data)),
+            LeafFormat::Bound => {
+                let version = *self
+                    .chunk_versions
+                    .get(idx)
+                    .ok_or(MerkleError::MissingChunkVersions)?;
+                Ok(hash_chunk_bound(
+                    idx as u64,
+                    data,
+                    version,
+                    self.merkle_attr.algorithm,
+                ))
+            }
         }
     }
 
@@ -2336,6 +2644,7 @@ impl<'a> Dataset<'a> {
             merkle_attr,
             tree_nodes,
             chunks,
+            chunk_versions: Vec::new(),
         }
     }
 
@@ -2574,10 +2883,17 @@ pub fn verify_chunk(d: &Dataset<'_>, idx: usize) -> Result<bool, MerkleError> {
     // independently re-derived root against the TRUSTED `d.merkle_attr.root`
     // (not `tree.root()`, which is just `tree_nodes[0]` read verbatim from the
     // same untrusted blob the old code already trusted too much).
+    //
+    // The leaf itself is computed through `Dataset::leaf_hash_for`, which
+    // dispatches on the dataset's integrity-bound `LeafFormat`. Calling
+    // `proof.compute_root(chunk_data)` here instead would hard-code the
+    // unbound `H(0x00 || chunk)` preimage and silently fail to verify — or
+    // worse, wrongly accept — a dataset written with bound leaves.
     let proof = tree
         .proof(idx)
         .ok_or(MerkleError::HyperslabOutOfBounds { idx })?;
-    let computed_root = proof.compute_root(chunk_data);
+    let leaf_hash = d.leaf_hash_for(idx, chunk_data)?;
+    let computed_root = proof.compute_root_from_hash(&leaf_hash);
     if constant_time_eq(&computed_root, &d.merkle_attr.root) {
         Ok(true)
     } else {
@@ -2692,7 +3008,9 @@ pub fn verify_dataset(d: &Dataset<'_>) -> Result<bool, MerkleError> {
     // null sentinel hash (H(0x02 || "null")), which won't match any real chunk.
     let mut live_leaves = Vec::with_capacity(stored_tree.leaf_count());
     for (idx, chunk) in d.chunks.iter().enumerate() {
-        let computed_hash = d.merkle_attr.algorithm.hash_leaf(chunk);
+        // Dispatches on the dataset's integrity-bound `LeafFormat`; see
+        // `Dataset::leaf_hash_for`.
+        let computed_hash = d.leaf_hash_for(idx, chunk)?;
         if let Some(stored_hash) = stored_tree.leaf_hash(idx)
             && !constant_time_eq(&computed_hash, stored_hash)
         {
@@ -3707,9 +4025,9 @@ mod tests {
         let attr = MerkleAttr::from_tree(&tree);
         let packed = attr.pack();
 
-        // Verify size (now 129 bytes with companion hash and grid hash)
+        // Verify size (now 130 bytes: companion hash, grid hash, leaf format)
         assert_eq!(packed.len(), MERKLE_ATTR_SIZE);
-        assert_eq!(packed.len(), 129);
+        assert_eq!(packed.len(), 130);
 
         // Unpack and verify round-trip
         let unpacked = MerkleAttr::unpack(&packed).expect("unpack should succeed");
@@ -4637,8 +4955,11 @@ mod tests {
         assert_eq!(attr_ref.integrity(), &attr.integrity);
         assert_eq!(attr_ref.companion_hash(), &attr.companion_hash);
 
-        // Version should be 0
-        assert_eq!(attr_ref.version(), MERKLE_ATTR_VERSION_0);
+        assert_eq!(attr_ref.leaf_format_id(), attr.leaf_format.to_id());
+        assert_eq!(attr_ref.leaf_format().unwrap(), attr.leaf_format);
+
+        // Version should be 1
+        assert_eq!(attr_ref.version(), MERKLE_ATTR_VERSION_1);
     }
 
     #[test]
@@ -4707,13 +5028,13 @@ mod tests {
     #[test]
     fn test_merkle_attr_ref_invalid_size() {
         // Too short
-        assert!(MerkleAttrRef::from_slice(&[0u8; 128]).is_err());
+        assert!(MerkleAttrRef::from_slice(&[0u8; 129]).is_err());
         // Too long
-        assert!(MerkleAttrRef::from_slice(&[0u8; 130]).is_err());
+        assert!(MerkleAttrRef::from_slice(&[0u8; 131]).is_err());
         // Empty
         assert!(MerkleAttrRef::from_slice(&[]).is_err());
-        // Current size (129 bytes) should work
-        assert!(MerkleAttrRef::from_slice(&[0u8; 129]).is_ok());
+        // Current size (130 bytes) should work
+        assert!(MerkleAttrRef::from_slice(&[0u8; 130]).is_ok());
     }
 
     #[test]
@@ -4755,14 +5076,15 @@ mod tests {
         let attr = MerkleAttr {
             root: [0u8; HASH_SIZE],
             algorithm: HashAlg::Blake3,
+            leaf_format: LeafFormat::Content,
             integrity: [0u8; HASH_SIZE],
             companion_hash: [0u8; HASH_SIZE],
             grid_hash: [0u8; HASH_SIZE],
         };
-        assert_eq!(attr.version(), MERKLE_ATTR_VERSION_0);
+        assert_eq!(attr.version(), MERKLE_ATTR_VERSION_1);
 
         // Size constants
-        assert_eq!(MERKLE_ATTR_SIZE, 129);
+        assert_eq!(MERKLE_ATTR_SIZE, 130);
     }
 
     /// Verify that `from_chunks_parallel` and `from_chunks` produce identical roots.
@@ -4895,6 +5217,7 @@ mod tests {
             merkle_attr: dataset.merkle_attr.clone(),
             tree_nodes: dataset.tree_nodes.clone(),
             chunks: tampered_refs,
+            chunk_versions: Vec::new(),
         };
 
         // Tampered chunk should fail
@@ -4928,6 +5251,7 @@ mod tests {
             merkle_attr: dataset.merkle_attr.clone(),
             tree_nodes: dataset.tree_nodes.clone(),
             chunks: tampered_refs,
+            chunk_versions: Vec::new(),
         };
 
         // Tampered dataset should fail with the correct chunk index
@@ -4958,6 +5282,7 @@ mod tests {
             merkle_attr: dataset.merkle_attr.clone(),
             tree_nodes: dataset.tree_nodes.clone(), // tree nodes unchanged
             chunks: tampered_refs,
+            chunk_versions: Vec::new(),
         };
 
         // verify_root should still pass (it only checks tree nodes, not chunk data)
@@ -4984,6 +5309,7 @@ mod tests {
             merkle_attr: dataset.merkle_attr.clone(), // still has original companion hash
             tree_nodes: tampered_nodes,
             chunks: refs,
+            chunk_versions: Vec::new(),
         };
 
         // verify_root should fail with CompanionTampered
@@ -5002,6 +5328,7 @@ mod tests {
         let merkle_attr = MerkleAttr {
             root: [0u8; 32],
             algorithm: HashAlg::Blake3,
+            leaf_format: LeafFormat::Content,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
             grid_hash: [0u8; 32],
@@ -5027,6 +5354,7 @@ mod tests {
         let merkle_attr = MerkleAttr {
             root: [0u8; 32],
             algorithm: HashAlg::Blake3,
+            leaf_format: LeafFormat::Content,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
             grid_hash: [0u8; 32],
@@ -5052,6 +5380,7 @@ mod tests {
         let merkle_attr = MerkleAttr {
             root: [0u8; 32],
             algorithm: HashAlg::Blake3,
+            leaf_format: LeafFormat::Content,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
             grid_hash: [0u8; 32],
@@ -5076,6 +5405,7 @@ mod tests {
         let merkle_attr = MerkleAttr {
             root: [0u8; 32],
             algorithm: HashAlg::Blake3,
+            leaf_format: LeafFormat::Content,
             integrity: [0u8; 32],
             companion_hash: [1u8; 32],
             grid_hash: [0u8; 32],
@@ -5265,6 +5595,7 @@ mod tests {
             merkle_attr: dataset.merkle_attr.clone(),
             tree_nodes: dataset.tree_nodes.clone(),
             chunks: tampered_refs,
+            chunk_versions: Vec::new(),
         };
 
         // Without pending: HashMismatch.
@@ -5297,6 +5628,192 @@ mod tests {
             Err(MerkleError::NoncePending)
         ));
         assert!(verify_chunk_with_pending(&dataset, 4, pending).is_ok());
+    }
+
+    // ===== LeafFormat: the P2.4 format/filters leaf-preimage split =====
+
+    /// Build a `Dataset` whose leaves use the bound preimage, the way a writer
+    /// going through the filter pipeline does.
+    #[cfg(feature = "blake3")]
+    fn bound_dataset(chunks: &[Vec<u8>], versions: &[u64]) -> (Vec<u8>, MerkleAttr) {
+        let leaves: Vec<[u8; HASH_SIZE]> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| hash_chunk_bound(i as u64, c, versions[i], HashAlg::Blake3))
+            .collect();
+        let tree = MerkleTree::build(&leaves, HashAlg::Blake3).expect("build");
+
+        let mut flat_nodes = Vec::with_capacity(tree.nodes().len() * HASH_SIZE);
+        for node in tree.nodes() {
+            flat_nodes.extend_from_slice(node);
+        }
+        let attr = MerkleAttr::from_tree(&tree).with_leaf_format(LeafFormat::Bound);
+        (flat_nodes, attr)
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn bound_leaf_dataset_verifies_end_to_end() {
+        // The gap TODO(P2.4) described: a tree built from bound leaves could
+        // not be verified by the format-side functions at all.
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 0];
+        let (nodes, attr) = bound_dataset(&chunks, &versions);
+
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let d = Dataset::from_owned(attr, nodes, refs).with_versions(versions);
+
+        assert!(verify_dataset(&d).expect("bound dataset must verify"));
+        for i in 0..chunks.len() {
+            assert!(verify_chunk(&d, i).expect("bound chunk must verify"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn bound_leaf_format_detects_position_swap() {
+        // Two chunks of EQUAL length and EQUAL version, so the only thing
+        // distinguishing them in the preimage is the bound index k.
+        let chunks = [b"AAAAAA".to_vec(), b"BBBBBB".to_vec()];
+        let versions = vec![3u64, 3];
+        let (nodes, attr) = bound_dataset(&chunks, &versions);
+
+        // Swap the two chunks' bytes, leaving the tree and versions untouched.
+        let swapped = [chunks[1].clone(), chunks[0].clone()];
+        let refs: Vec<&[u8]> = swapped.iter().map(Vec::as_slice).collect();
+        let d = Dataset::from_owned(attr, nodes, refs).with_versions(versions);
+
+        assert!(
+            verify_dataset(&d).is_err(),
+            "position-swapped chunks must be rejected when k is bound"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn content_leaf_format_misses_position_swap() {
+        // The same swap under the unbound preimage: both chunks hash to the
+        // same leaf set in the same order, so nothing detects the exchange.
+        // This is the property that made the format/filters split a security
+        // bug and not merely an inconvenience.
+        let chunks = [b"AAAAAA".to_vec(), b"BBBBBB".to_vec()];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let tree = MerkleTree::from_chunks(&refs, HashAlg::Blake3);
+        let attr = MerkleAttr::from_tree(&tree);
+        assert_eq!(attr.leaf_format, LeafFormat::Content);
+
+        let swapped = [chunks[1].clone(), chunks[0].clone()];
+        let swapped_refs: Vec<&[u8]> = swapped.iter().map(Vec::as_slice).collect();
+        let tree2 = MerkleTree::from_chunks(&swapped_refs, HashAlg::Blake3);
+
+        assert_ne!(
+            tree.root(),
+            tree2.root(),
+            "sanity: the leaf ORDER still changes the root"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn bound_leaf_format_detects_version_rollback() {
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 9];
+        let (nodes, attr) = bound_dataset(&chunks, &versions);
+
+        // Roll chunk 3's version back; its bytes are untouched.
+        let mut rolled = versions.clone();
+        rolled[3] = 8;
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let d = Dataset::from_owned(attr, nodes, refs).with_versions(rolled);
+
+        assert!(
+            matches!(
+                verify_dataset(&d),
+                Err(MerkleError::HashMismatch { chunk_idx: 3 })
+            ),
+            "a rolled-back version must break the leaf that binds it"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn bound_leaf_format_without_versions_fails_closed() {
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 0];
+        let (nodes, attr) = bound_dataset(&chunks, &versions);
+
+        // No `.with_versions(..)`: we cannot recompute the committed preimage.
+        // Substituting zeros would silently accept a rolled-back chunk, so
+        // this must be an error rather than a verification result.
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let d = Dataset::from_owned(attr, nodes, refs);
+
+        assert!(matches!(
+            verify_dataset(&d),
+            Err(MerkleError::MissingChunkVersions)
+        ));
+        assert!(matches!(
+            verify_chunk(&d, 0),
+            Err(MerkleError::MissingChunkVersions)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn leaf_format_downgrade_is_rejected_on_unpack() {
+        // The whole point of folding leaf_format into compute_integrity: an
+        // attacker who flips Bound -> Content would strip index and version
+        // binding from every subsequent verification.
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 0];
+        let (_nodes, attr) = bound_dataset(&chunks, &versions);
+
+        let mut packed = attr.pack();
+        assert_eq!(packed[ATTR_LEAF_FMT_OFFSET], LeafFormat::Bound.to_id());
+        packed[ATTR_LEAF_FMT_OFFSET] = LeafFormat::Content.to_id();
+
+        assert!(
+            matches!(
+                MerkleAttr::unpack(&packed),
+                Err(MerkleError::InvalidAttribute {
+                    reason: InvalidAttrReason::IntegrityMismatch
+                })
+            ),
+            "downgrading the leaf-format byte must invalidate the attribute"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn unknown_leaf_format_fails_closed() {
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 0];
+        let (_nodes, attr) = bound_dataset(&chunks, &versions);
+
+        let mut packed = attr.pack();
+        packed[ATTR_LEAF_FMT_OFFSET] = 0xEE;
+
+        assert!(
+            matches!(
+                MerkleAttr::unpack(&packed),
+                Err(MerkleError::InvalidAttribute {
+                    reason: InvalidAttrReason::UnknownLeafFormat
+                })
+            ),
+            "an unrecognised leaf format must not be read as Content"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "blake3")]
+    fn leaf_format_round_trips_through_pack() {
+        let chunks = make_test_chunks();
+        let versions = vec![7u64, 1, 42, 0];
+        let (_nodes, attr) = bound_dataset(&chunks, &versions);
+
+        let unpacked = MerkleAttr::unpack(&attr.pack()).expect("round-trip");
+        assert_eq!(unpacked.leaf_format, LeafFormat::Bound);
+        assert_eq!(unpacked.integrity, attr.integrity);
     }
 }
 
